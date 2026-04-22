@@ -1,0 +1,21 @@
+EvalGuard
+Copyright 2024-2026 EvalGuard, Inc.
+
+This product includes software developed by EvalGuard, Inc.
+(https://evalguard.ai).
+
+The client libraries (Python SDK, Go SDK, JavaScript/TypeScript SDK, CLI) are
+licensed under the Apache License, Version 2.0. The EvalGuard service, API,
+and proprietary backend engine (including but not limited to evaluation
+scorers, red-team attack plugins, ML classifiers, DLP dictionaries, firewall
+engine, and gateway) are operated as a hosted service by EvalGuard, Inc. and
+are NOT licensed under Apache 2.0 — they are proprietary software accessed
+via the API, subject to the EvalGuard Terms of Service at
+https://evalguard.ai/terms.
+
+The name "EvalGuard" and the EvalGuard logo are trademarks of EvalGuard, Inc.
+Use of these marks is subject to the Trademark Policy at
+https://evalguard.ai/trademark. Downstream redistributions of this software
+(whether as Source or Object form) may use the Apache 2.0 license text but
+must NOT use the "EvalGuard" name or logo to imply endorsement, affiliation,
+or compatibility with the EvalGuard service without written permission.

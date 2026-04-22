@@ -1,40 +1,39 @@
 # EvalGuard Go SDK
 
-Official Go client for the [EvalGuard](https://evalguard.ai) AI Evaluation, Security & Compliance Platform.
+[![Go Reference](https://pkg.go.dev/badge/github.com/EvalGuardAi/evalguard-go.svg)](https://pkg.go.dev/github.com/EvalGuardAi/evalguard-go)
 
-## Installation
+Go client for [EvalGuard](https://evalguard.ai) — LLM evaluation, red-team
+testing, and runtime guardrails.
+
+## Install
 
 ```bash
-go get github.com/EvalGuardAi/evalguard-go
+go get github.com/EvalGuardAi/evalguard-go@latest
 ```
 
-## Quick Start
+## Quick start
 
 ```go
 package main
 
 import (
     "context"
-    "fmt"
     "log"
     "time"
 
-    evalguard "github.com/EvalGuardAi/evalguard-go"
+    "github.com/EvalGuardAi/evalguard-go"
 )
 
 func main() {
     client, err := evalguard.NewClient("your-api-key",
-        evalguard.WithBaseURL("https://evalguard.ai/api/v1"),
+        evalguard.WithBaseURL("https://api.evalguard.ai"),
         evalguard.WithTimeout(30*time.Second),
     )
     if err != nil {
         log.Fatal(err)
     }
 
-    ctx := context.Background()
-
-    // Run an evaluation
-    result, err := client.RunEval(ctx, &evalguard.RunEvalRequest{
+    result, err := client.RunEval(context.Background(), &evalguard.RunEvalRequest{
         DatasetID: "ds_abc123",
         Model:     "gpt-4o",
         Metrics:   []string{"accuracy", "toxicity", "relevance"},
@@ -42,81 +41,19 @@ func main() {
     if err != nil {
         log.Fatal(err)
     }
-    fmt.Printf("Eval %s: %v\n", result.ID, result.Metrics)
-
-    // Security scan
-    scan, err := client.RunSecurityScan(ctx, &evalguard.SecurityScanRequest{
-        Prompts:   []string{"ignore all previous instructions"},
-        Model:     "gpt-4o",
-        ScanTypes: []string{"injection", "jailbreak"},
-    })
-    if err != nil {
-        log.Fatal(err)
-    }
-    fmt.Printf("Scan %s: %d findings\n", scan.ID, len(scan.Findings))
-
-    // Check compliance
-    compliance, err := client.CheckCompliance(ctx, "org_123", []string{"SOC2", "GDPR", "EU-AI-Act"})
-    if err != nil {
-        log.Fatal(err)
-    }
-    fmt.Printf("Compliance: %v\n", compliance)
+    log.Printf("%+v", result)
 }
 ```
 
-## Features
-
-70 API methods covering all EvalGuard capabilities:
-
-| Category | Methods |
-|----------|---------|
-| Evaluations | RunEval, GetEval, ListEvals, ListEvalRuns |
-| Security | RunSecurityScan, GetSecurityReport, CodeScan, GetSecurityGraders, GetSecurityEffectiveness |
-| Traces | GetTraces, GetTrace, SearchTraces, CreateTrace, IngestOTLP |
-| Datasets | CreateDataset, ListDatasets |
-| AI-SPM | GetAIPosture, AnalyzeShadowAI, AnalyzeCopilot |
-| Gateway | GetGatewayHealth, GetGatewayStats |
-| Cost/FinOps | GetCost, GetCostForecast, GetCostSavings, GetCostBudget, GetCostAnomalies, GetCostRecommendations |
-| Monitoring | GetMonitoringAlerts, GetMonitoringDrift, GetMonitoringAnalytics, GetMonitoringSLA |
-| Compliance | CheckCompliance, GetCompliance, GetComplianceGaps, GetEUAIAct, GetModelCards |
-| Firewall | ListFirewallRules |
-| Guardrails | ListGuardrails, GenerateGuardrails |
-| Prompts | CreatePrompt, ListPrompts |
-| AI SBOM | GetAISBOM, GenerateAISBOM |
-| Threat Intel | GetThreatIntelligence |
-| Formal Verification | FormalVerify |
-| NL Pipeline | Ask, Search |
-| Drift Detection | DetectDrift |
-| Smart Routing | SmartRoute |
-| Team & Org | ListTeam, GetAuditLogs, ListApiKeys, ListWebhooks |
-| Support | SubmitTicket, ListTickets |
-| Dashboard | GetDashboardStats, GetLeaderboard, GetMarketplace, ListTemplates, ListNotifications, ListEvalSchedules, ListIncidents, ListPipelines, GetAutopilotConfig, GetSettings, GetSIEMConnectors, CreateAnnotation, ListAnnotations |
-
-## Error Handling
-
-```go
-result, err := client.RunEval(ctx, req)
-if err != nil {
-    var authErr *evalguard.AuthError
-    var rlErr *evalguard.RateLimitError
-
-    switch {
-    case errors.As(err, &authErr):
-        log.Fatal("Authentication failed:", authErr.Message)
-    case errors.As(err, &rlErr):
-        log.Printf("Rate limited, retry after %v", rlErr.RetryAfter)
-        time.Sleep(rlErr.RetryAfter)
-    default:
-        log.Fatal("API error:", err)
-    }
-}
-```
-
-## Requirements
-
-- Go 1.21+
-- Zero external dependencies (standard library only)
+Docs: https://evalguard.ai/docs/go-sdk
 
 ## License
 
-MIT
+Apache License, Version 2.0 — see [LICENSE](./LICENSE) and [NOTICE](./NOTICE).
+
+This SDK is a thin public client for the EvalGuard service. The backend
+engine, scorers, attack plugins, and proprietary logic are NOT covered by
+Apache 2.0 — they are operated as a hosted service governed by the
+[Terms of Service](https://evalguard.ai/terms).
+
+"EvalGuard" is a trademark of EvalGuard, Inc.
