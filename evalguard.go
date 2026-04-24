@@ -23,9 +23,16 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
+	"net/url"
 	"strconv"
 	"time"
+)
+
+const (
+	maxRetries     = 3
+	baseRetryDelay = 500 * time.Millisecond
 )
 
 const (
@@ -351,7 +358,9 @@ type AIPostureResult struct {
 // GetAIPosture retrieves the AI security posture management dashboard.
 func (c *Client) GetAIPosture(ctx context.Context, projectID string) (*AIPostureResult, error) {
 	var result AIPostureResult
-	if err := c.doRequest(ctx, http.MethodGet, "/ai-spm?projectId="+projectID, nil, &result); err != nil {
+	q := url.Values{}
+	q.Set("projectId", projectID)
+	if err := c.doRequest(ctx, http.MethodGet, "/ai-spm?"+q.Encode(), nil, &result); err != nil {
 		return nil, fmt.Errorf("GetAIPosture: %w", err)
 	}
 	return &result, nil
@@ -398,7 +407,9 @@ func (c *Client) GetGatewayHealth(ctx context.Context) (map[string]any, error) {
 // GetGatewayStats returns gateway usage statistics.
 func (c *Client) GetGatewayStats(ctx context.Context, projectID string) (map[string]any, error) {
 	var result map[string]any
-	if err := c.doRequest(ctx, http.MethodGet, "/gateway/stats?projectId="+projectID, nil, &result); err != nil {
+	q := url.Values{}
+	q.Set("projectId", projectID)
+	if err := c.doRequest(ctx, http.MethodGet, "/gateway/stats?"+q.Encode(), nil, &result); err != nil {
 		return nil, fmt.Errorf("GetGatewayStats: %w", err)
 	}
 	return result, nil
@@ -409,7 +420,10 @@ func (c *Client) GetGatewayStats(ctx context.Context, projectID string) (map[str
 // GetCost returns cost analytics for a project.
 func (c *Client) GetCost(ctx context.Context, projectID, period string) (map[string]any, error) {
 	var result map[string]any
-	if err := c.doRequest(ctx, http.MethodGet, "/cost?projectId="+projectID+"&period="+period, nil, &result); err != nil {
+	q := url.Values{}
+	q.Set("projectId", projectID)
+	q.Set("period", period)
+	if err := c.doRequest(ctx, http.MethodGet, "/cost?"+q.Encode(), nil, &result); err != nil {
 		return nil, fmt.Errorf("GetCost: %w", err)
 	}
 	return result, nil
@@ -418,7 +432,9 @@ func (c *Client) GetCost(ctx context.Context, projectID, period string) (map[str
 // GetCostForecast returns cost forecasting data.
 func (c *Client) GetCostForecast(ctx context.Context, projectID string) (map[string]any, error) {
 	var result map[string]any
-	if err := c.doRequest(ctx, http.MethodGet, "/cost/forecast?projectId="+projectID, nil, &result); err != nil {
+	q := url.Values{}
+	q.Set("projectId", projectID)
+	if err := c.doRequest(ctx, http.MethodGet, "/cost/forecast?"+q.Encode(), nil, &result); err != nil {
 		return nil, fmt.Errorf("GetCostForecast: %w", err)
 	}
 	return result, nil
@@ -429,7 +445,9 @@ func (c *Client) GetCostForecast(ctx context.Context, projectID string) (map[str
 // GetMonitoringAlerts returns active monitoring alerts.
 func (c *Client) GetMonitoringAlerts(ctx context.Context, projectID string) (map[string]any, error) {
 	var result map[string]any
-	if err := c.doRequest(ctx, http.MethodGet, "/monitoring/alerts?projectId="+projectID, nil, &result); err != nil {
+	q := url.Values{}
+	q.Set("projectId", projectID)
+	if err := c.doRequest(ctx, http.MethodGet, "/monitoring/alerts?"+q.Encode(), nil, &result); err != nil {
 		return nil, fmt.Errorf("GetMonitoringAlerts: %w", err)
 	}
 	return result, nil
@@ -438,7 +456,9 @@ func (c *Client) GetMonitoringAlerts(ctx context.Context, projectID string) (map
 // GetMonitoringDrift returns drift detection status.
 func (c *Client) GetMonitoringDrift(ctx context.Context, projectID string) (map[string]any, error) {
 	var result map[string]any
-	if err := c.doRequest(ctx, http.MethodGet, "/monitoring/drift?projectId="+projectID, nil, &result); err != nil {
+	q := url.Values{}
+	q.Set("projectId", projectID)
+	if err := c.doRequest(ctx, http.MethodGet, "/monitoring/drift?"+q.Encode(), nil, &result); err != nil {
 		return nil, fmt.Errorf("GetMonitoringDrift: %w", err)
 	}
 	return result, nil
@@ -471,7 +491,9 @@ func (c *Client) CreatePrompt(ctx context.Context, projectID, name, content, mod
 // ListPrompts returns all prompts for a project.
 func (c *Client) ListPrompts(ctx context.Context, projectID string) ([]map[string]any, error) {
 	var result []map[string]any
-	if err := c.doRequest(ctx, http.MethodGet, "/prompts?projectId="+projectID, nil, &result); err != nil {
+	q := url.Values{}
+	q.Set("projectId", projectID)
+	if err := c.doRequest(ctx, http.MethodGet, "/prompts?"+q.Encode(), nil, &result); err != nil {
 		return nil, fmt.Errorf("ListPrompts: %w", err)
 	}
 	return result, nil
@@ -482,7 +504,9 @@ func (c *Client) ListPrompts(ctx context.Context, projectID string) ([]map[strin
 // ListFirewallRules returns all firewall rules for a project.
 func (c *Client) ListFirewallRules(ctx context.Context, projectID string) ([]map[string]any, error) {
 	var result []map[string]any
-	if err := c.doRequest(ctx, http.MethodGet, "/firewall/rules?projectId="+projectID, nil, &result); err != nil {
+	q := url.Values{}
+	q.Set("projectId", projectID)
+	if err := c.doRequest(ctx, http.MethodGet, "/firewall/rules?"+q.Encode(), nil, &result); err != nil {
 		return nil, fmt.Errorf("ListFirewallRules: %w", err)
 	}
 	return result, nil
@@ -493,7 +517,9 @@ func (c *Client) ListFirewallRules(ctx context.Context, projectID string) ([]map
 // ListGuardrails returns all guardrails for a project.
 func (c *Client) ListGuardrails(ctx context.Context, projectID string) (map[string]any, error) {
 	var result map[string]any
-	if err := c.doRequest(ctx, http.MethodGet, "/guardrails?projectId="+projectID, nil, &result); err != nil {
+	q := url.Values{}
+	q.Set("projectId", projectID)
+	if err := c.doRequest(ctx, http.MethodGet, "/guardrails?"+q.Encode(), nil, &result); err != nil {
 		return nil, fmt.Errorf("ListGuardrails: %w", err)
 	}
 	return result, nil
@@ -516,7 +542,9 @@ func (c *Client) SubmitTicket(ctx context.Context, ticketType, subject, descript
 // GetThreatIntelligence returns the latest threat intelligence feed.
 func (c *Client) GetThreatIntelligence(ctx context.Context, projectID string) (map[string]any, error) {
 	var result map[string]any
-	if err := c.doRequest(ctx, http.MethodGet, "/threat-intelligence?projectId="+projectID, nil, &result); err != nil {
+	q := url.Values{}
+	q.Set("projectId", projectID)
+	if err := c.doRequest(ctx, http.MethodGet, "/threat-intelligence?"+q.Encode(), nil, &result); err != nil {
 		return nil, fmt.Errorf("GetThreatIntelligence: %w", err)
 	}
 	return result, nil
@@ -527,7 +555,9 @@ func (c *Client) GetThreatIntelligence(ctx context.Context, projectID string) (m
 // GetAISBOM returns the AI Software Bill of Materials.
 func (c *Client) GetAISBOM(ctx context.Context, projectID string) (map[string]any, error) {
 	var result map[string]any
-	if err := c.doRequest(ctx, http.MethodGet, "/ai-sbom?projectId="+projectID, nil, &result); err != nil {
+	q := url.Values{}
+	q.Set("projectId", projectID)
+	if err := c.doRequest(ctx, http.MethodGet, "/ai-sbom?"+q.Encode(), nil, &result); err != nil {
 		return nil, fmt.Errorf("GetAISBOM: %w", err)
 	}
 	return result, nil
@@ -538,7 +568,9 @@ func (c *Client) GetAISBOM(ctx context.Context, projectID string) (map[string]an
 // ListTeam returns team members for an organization.
 func (c *Client) ListTeam(ctx context.Context, orgID string) ([]map[string]any, error) {
 	var result []map[string]any
-	if err := c.doRequest(ctx, http.MethodGet, "/team?orgId="+orgID, nil, &result); err != nil {
+	q := url.Values{}
+	q.Set("orgId", orgID)
+	if err := c.doRequest(ctx, http.MethodGet, "/team?"+q.Encode(), nil, &result); err != nil {
 		return nil, fmt.Errorf("ListTeam: %w", err)
 	}
 	return result, nil
@@ -547,7 +579,9 @@ func (c *Client) ListTeam(ctx context.Context, orgID string) ([]map[string]any, 
 // GetAuditLogs returns audit logs for an organization.
 func (c *Client) GetAuditLogs(ctx context.Context, orgID string) ([]map[string]any, error) {
 	var result []map[string]any
-	if err := c.doRequest(ctx, http.MethodGet, "/audit-logs?orgId="+orgID, nil, &result); err != nil {
+	q := url.Values{}
+	q.Set("orgId", orgID)
+	if err := c.doRequest(ctx, http.MethodGet, "/audit-logs?"+q.Encode(), nil, &result); err != nil {
 		return nil, fmt.Errorf("GetAuditLogs: %w", err)
 	}
 	return result, nil
@@ -587,12 +621,14 @@ func (c *Client) Ask(ctx context.Context, question, projectID string) (map[strin
 
 // GetLeaderboard returns the public model leaderboard.
 func (c *Client) GetLeaderboard(ctx context.Context, category string) (map[string]any, error) {
-	q := ""
+	path := "/leaderboard"
 	if category != "" {
-		q = "?category=" + category
+		q := url.Values{}
+		q.Set("category", category)
+		path += "?" + q.Encode()
 	}
 	var result map[string]any
-	if err := c.doRequest(ctx, http.MethodGet, "/leaderboard"+q, nil, &result); err != nil {
+	if err := c.doRequest(ctx, http.MethodGet, path, nil, &result); err != nil {
 		return nil, fmt.Errorf("GetLeaderboard: %w", err)
 	}
 	return result, nil
@@ -603,7 +639,9 @@ func (c *Client) GetLeaderboard(ctx context.Context, category string) (map[strin
 // ListEvalRuns returns eval run history.
 func (c *Client) ListEvalRuns(ctx context.Context, projectID string) ([]map[string]any, error) {
 	var result []map[string]any
-	if err := c.doRequest(ctx, http.MethodGet, "/evals/runs?projectId="+projectID, nil, &result); err != nil {
+	q := url.Values{}
+	q.Set("projectId", projectID)
+	if err := c.doRequest(ctx, http.MethodGet, "/evals/runs?"+q.Encode(), nil, &result); err != nil {
 		return nil, fmt.Errorf("ListEvalRuns: %w", err)
 	}
 	return result, nil
@@ -614,7 +652,9 @@ func (c *Client) ListEvalRuns(ctx context.Context, projectID string) ([]map[stri
 // GetSecurityGraders returns available security graders.
 func (c *Client) GetSecurityGraders(ctx context.Context, projectID string) ([]map[string]any, error) {
 	var result []map[string]any
-	if err := c.doRequest(ctx, http.MethodGet, "/security/graders?projectId="+projectID, nil, &result); err != nil {
+	q := url.Values{}
+	q.Set("projectId", projectID)
+	if err := c.doRequest(ctx, http.MethodGet, "/security/graders?"+q.Encode(), nil, &result); err != nil {
 		return nil, fmt.Errorf("GetSecurityGraders: %w", err)
 	}
 	return result, nil
@@ -623,7 +663,9 @@ func (c *Client) GetSecurityGraders(ctx context.Context, projectID string) ([]ma
 // GetSecurityEffectiveness returns security effectiveness metrics.
 func (c *Client) GetSecurityEffectiveness(ctx context.Context, projectID string) (map[string]any, error) {
 	var result map[string]any
-	if err := c.doRequest(ctx, http.MethodGet, "/security/effectiveness?projectId="+projectID, nil, &result); err != nil {
+	q := url.Values{}
+	q.Set("projectId", projectID)
+	if err := c.doRequest(ctx, http.MethodGet, "/security/effectiveness?"+q.Encode(), nil, &result); err != nil {
 		return nil, fmt.Errorf("GetSecurityEffectiveness: %w", err)
 	}
 	return result, nil
@@ -632,7 +674,9 @@ func (c *Client) GetSecurityEffectiveness(ctx context.Context, projectID string)
 // GetSecurityReport returns a security scan report.
 func (c *Client) GetSecurityReport(ctx context.Context, scanID string) (map[string]any, error) {
 	var result map[string]any
-	if err := c.doRequest(ctx, http.MethodGet, "/security/report?scanId="+scanID, nil, &result); err != nil {
+	q := url.Values{}
+	q.Set("scanId", scanID)
+	if err := c.doRequest(ctx, http.MethodGet, "/security/report?"+q.Encode(), nil, &result); err != nil {
 		return nil, fmt.Errorf("GetSecurityReport: %w", err)
 	}
 	return result, nil
@@ -662,7 +706,10 @@ func (c *Client) GetTrace(ctx context.Context, traceID string) (map[string]any, 
 // SearchTraces searches traces by query.
 func (c *Client) SearchTraces(ctx context.Context, projectID, query string) (map[string]any, error) {
 	var result map[string]any
-	if err := c.doRequest(ctx, http.MethodGet, "/traces/search?projectId="+projectID+"&q="+query, nil, &result); err != nil {
+	q := url.Values{}
+	q.Set("projectId", projectID)
+	q.Set("q", query)
+	if err := c.doRequest(ctx, http.MethodGet, "/traces/search?"+q.Encode(), nil, &result); err != nil {
 		return nil, fmt.Errorf("SearchTraces: %w", err)
 	}
 	return result, nil
@@ -693,7 +740,9 @@ func (c *Client) IngestOTLP(ctx context.Context, resourceSpans []map[string]any)
 // GetCostSavings returns cost saving opportunities.
 func (c *Client) GetCostSavings(ctx context.Context, projectID string) (map[string]any, error) {
 	var result map[string]any
-	if err := c.doRequest(ctx, http.MethodGet, "/cost/savings?projectId="+projectID, nil, &result); err != nil {
+	q := url.Values{}
+	q.Set("projectId", projectID)
+	if err := c.doRequest(ctx, http.MethodGet, "/cost/savings?"+q.Encode(), nil, &result); err != nil {
 		return nil, fmt.Errorf("GetCostSavings: %w", err)
 	}
 	return result, nil
@@ -702,7 +751,9 @@ func (c *Client) GetCostSavings(ctx context.Context, projectID string) (map[stri
 // GetCostBudget returns cost budget configuration.
 func (c *Client) GetCostBudget(ctx context.Context, projectID string) (map[string]any, error) {
 	var result map[string]any
-	if err := c.doRequest(ctx, http.MethodGet, "/cost/budget?projectId="+projectID, nil, &result); err != nil {
+	q := url.Values{}
+	q.Set("projectId", projectID)
+	if err := c.doRequest(ctx, http.MethodGet, "/cost/budget?"+q.Encode(), nil, &result); err != nil {
 		return nil, fmt.Errorf("GetCostBudget: %w", err)
 	}
 	return result, nil
@@ -711,7 +762,9 @@ func (c *Client) GetCostBudget(ctx context.Context, projectID string) (map[strin
 // GetCostAnomalies returns cost anomaly detection results.
 func (c *Client) GetCostAnomalies(ctx context.Context, projectID string) (map[string]any, error) {
 	var result map[string]any
-	if err := c.doRequest(ctx, http.MethodGet, "/cost/anomalies?projectId="+projectID, nil, &result); err != nil {
+	q := url.Values{}
+	q.Set("projectId", projectID)
+	if err := c.doRequest(ctx, http.MethodGet, "/cost/anomalies?"+q.Encode(), nil, &result); err != nil {
 		return nil, fmt.Errorf("GetCostAnomalies: %w", err)
 	}
 	return result, nil
@@ -720,7 +773,9 @@ func (c *Client) GetCostAnomalies(ctx context.Context, projectID string) (map[st
 // GetCostRecommendations returns cost optimization recommendations.
 func (c *Client) GetCostRecommendations(ctx context.Context, projectID string) (map[string]any, error) {
 	var result map[string]any
-	if err := c.doRequest(ctx, http.MethodGet, "/cost/recommendations?projectId="+projectID, nil, &result); err != nil {
+	q := url.Values{}
+	q.Set("projectId", projectID)
+	if err := c.doRequest(ctx, http.MethodGet, "/cost/recommendations?"+q.Encode(), nil, &result); err != nil {
 		return nil, fmt.Errorf("GetCostRecommendations: %w", err)
 	}
 	return result, nil
@@ -731,7 +786,9 @@ func (c *Client) GetCostRecommendations(ctx context.Context, projectID string) (
 // GetMonitoringAnalytics returns monitoring analytics.
 func (c *Client) GetMonitoringAnalytics(ctx context.Context, projectID string) (map[string]any, error) {
 	var result map[string]any
-	if err := c.doRequest(ctx, http.MethodGet, "/monitoring/analytics?projectId="+projectID, nil, &result); err != nil {
+	q := url.Values{}
+	q.Set("projectId", projectID)
+	if err := c.doRequest(ctx, http.MethodGet, "/monitoring/analytics?"+q.Encode(), nil, &result); err != nil {
 		return nil, fmt.Errorf("GetMonitoringAnalytics: %w", err)
 	}
 	return result, nil
@@ -740,7 +797,9 @@ func (c *Client) GetMonitoringAnalytics(ctx context.Context, projectID string) (
 // GetMonitoringSLA returns SLA monitoring data.
 func (c *Client) GetMonitoringSLA(ctx context.Context, projectID string) (map[string]any, error) {
 	var result map[string]any
-	if err := c.doRequest(ctx, http.MethodGet, "/monitoring/sla?projectId="+projectID, nil, &result); err != nil {
+	q := url.Values{}
+	q.Set("projectId", projectID)
+	if err := c.doRequest(ctx, http.MethodGet, "/monitoring/sla?"+q.Encode(), nil, &result); err != nil {
 		return nil, fmt.Errorf("GetMonitoringSLA: %w", err)
 	}
 	return result, nil
@@ -751,7 +810,9 @@ func (c *Client) GetMonitoringSLA(ctx context.Context, projectID string) (map[st
 // GetCompliance returns compliance status.
 func (c *Client) GetCompliance(ctx context.Context, orgID string) (map[string]any, error) {
 	var result map[string]any
-	if err := c.doRequest(ctx, http.MethodGet, "/compliance?orgId="+orgID, nil, &result); err != nil {
+	q := url.Values{}
+	q.Set("orgId", orgID)
+	if err := c.doRequest(ctx, http.MethodGet, "/compliance?"+q.Encode(), nil, &result); err != nil {
 		return nil, fmt.Errorf("GetCompliance: %w", err)
 	}
 	return result, nil
@@ -760,7 +821,10 @@ func (c *Client) GetCompliance(ctx context.Context, orgID string) (map[string]an
 // GetComplianceGaps returns compliance gaps.
 func (c *Client) GetComplianceGaps(ctx context.Context, orgID, framework string) (map[string]any, error) {
 	var result map[string]any
-	if err := c.doRequest(ctx, http.MethodGet, "/compliance/gaps?orgId="+orgID+"&framework="+framework, nil, &result); err != nil {
+	q := url.Values{}
+	q.Set("orgId", orgID)
+	q.Set("framework", framework)
+	if err := c.doRequest(ctx, http.MethodGet, "/compliance/gaps?"+q.Encode(), nil, &result); err != nil {
 		return nil, fmt.Errorf("GetComplianceGaps: %w", err)
 	}
 	return result, nil
@@ -769,7 +833,9 @@ func (c *Client) GetComplianceGaps(ctx context.Context, orgID, framework string)
 // GetEUAIAct returns EU AI Act compliance status.
 func (c *Client) GetEUAIAct(ctx context.Context, orgID string) (map[string]any, error) {
 	var result map[string]any
-	if err := c.doRequest(ctx, http.MethodGet, "/compliance/eu-ai-act?orgId="+orgID, nil, &result); err != nil {
+	q := url.Values{}
+	q.Set("orgId", orgID)
+	if err := c.doRequest(ctx, http.MethodGet, "/compliance/eu-ai-act?"+q.Encode(), nil, &result); err != nil {
 		return nil, fmt.Errorf("GetEUAIAct: %w", err)
 	}
 	return result, nil
@@ -778,7 +844,9 @@ func (c *Client) GetEUAIAct(ctx context.Context, orgID string) (map[string]any, 
 // GetModelCards returns model cards for compliance.
 func (c *Client) GetModelCards(ctx context.Context, projectID string) (map[string]any, error) {
 	var result map[string]any
-	if err := c.doRequest(ctx, http.MethodGet, "/compliance/model-cards?projectId="+projectID, nil, &result); err != nil {
+	q := url.Values{}
+	q.Set("projectId", projectID)
+	if err := c.doRequest(ctx, http.MethodGet, "/compliance/model-cards?"+q.Encode(), nil, &result); err != nil {
 		return nil, fmt.Errorf("GetModelCards: %w", err)
 	}
 	return result, nil
@@ -789,7 +857,9 @@ func (c *Client) GetModelCards(ctx context.Context, projectID string) (map[strin
 // ListDatasets returns all datasets for a project.
 func (c *Client) ListDatasets(ctx context.Context, projectID string) ([]map[string]any, error) {
 	var result []map[string]any
-	if err := c.doRequest(ctx, http.MethodGet, "/datasets?projectId="+projectID, nil, &result); err != nil {
+	q := url.Values{}
+	q.Set("projectId", projectID)
+	if err := c.doRequest(ctx, http.MethodGet, "/datasets?"+q.Encode(), nil, &result); err != nil {
 		return nil, fmt.Errorf("ListDatasets: %w", err)
 	}
 	return result, nil
@@ -810,7 +880,9 @@ func (c *Client) CreateAnnotation(ctx context.Context, projectID, logID, label s
 // ListAnnotations returns annotations for a project.
 func (c *Client) ListAnnotations(ctx context.Context, projectID string) ([]map[string]any, error) {
 	var result []map[string]any
-	if err := c.doRequest(ctx, http.MethodGet, "/annotations?projectId="+projectID, nil, &result); err != nil {
+	q := url.Values{}
+	q.Set("projectId", projectID)
+	if err := c.doRequest(ctx, http.MethodGet, "/annotations?"+q.Encode(), nil, &result); err != nil {
 		return nil, fmt.Errorf("ListAnnotations: %w", err)
 	}
 	return result, nil
@@ -821,7 +893,9 @@ func (c *Client) ListAnnotations(ctx context.Context, projectID string) ([]map[s
 // ListWebhooks returns webhooks for an organization.
 func (c *Client) ListWebhooks(ctx context.Context, orgID string) ([]map[string]any, error) {
 	var result []map[string]any
-	if err := c.doRequest(ctx, http.MethodGet, "/webhooks?orgId="+orgID, nil, &result); err != nil {
+	q := url.Values{}
+	q.Set("orgId", orgID)
+	if err := c.doRequest(ctx, http.MethodGet, "/webhooks?"+q.Encode(), nil, &result); err != nil {
 		return nil, fmt.Errorf("ListWebhooks: %w", err)
 	}
 	return result, nil
@@ -830,7 +904,9 @@ func (c *Client) ListWebhooks(ctx context.Context, orgID string) ([]map[string]a
 // ListApiKeys returns API keys for an organization.
 func (c *Client) ListApiKeys(ctx context.Context, orgID string) ([]map[string]any, error) {
 	var result []map[string]any
-	if err := c.doRequest(ctx, http.MethodGet, "/api-keys?orgId="+orgID, nil, &result); err != nil {
+	q := url.Values{}
+	q.Set("orgId", orgID)
+	if err := c.doRequest(ctx, http.MethodGet, "/api-keys?"+q.Encode(), nil, &result); err != nil {
 		return nil, fmt.Errorf("ListApiKeys: %w", err)
 	}
 	return result, nil
@@ -841,7 +917,9 @@ func (c *Client) ListApiKeys(ctx context.Context, orgID string) ([]map[string]an
 // GetSIEMConnectors returns SIEM connector configuration.
 func (c *Client) GetSIEMConnectors(ctx context.Context, projectID string) (map[string]any, error) {
 	var result map[string]any
-	if err := c.doRequest(ctx, http.MethodGet, "/siem?projectId="+projectID, nil, &result); err != nil {
+	q := url.Values{}
+	q.Set("projectId", projectID)
+	if err := c.doRequest(ctx, http.MethodGet, "/siem?"+q.Encode(), nil, &result); err != nil {
 		return nil, fmt.Errorf("GetSIEMConnectors: %w", err)
 	}
 	return result, nil
@@ -850,7 +928,9 @@ func (c *Client) GetSIEMConnectors(ctx context.Context, projectID string) (map[s
 // GetSettings returns project settings.
 func (c *Client) GetSettings(ctx context.Context, projectID string) (map[string]any, error) {
 	var result map[string]any
-	if err := c.doRequest(ctx, http.MethodGet, "/settings?projectId="+projectID, nil, &result); err != nil {
+	q := url.Values{}
+	q.Set("projectId", projectID)
+	if err := c.doRequest(ctx, http.MethodGet, "/settings?"+q.Encode(), nil, &result); err != nil {
 		return nil, fmt.Errorf("GetSettings: %w", err)
 	}
 	return result, nil
@@ -886,7 +966,9 @@ func (c *Client) GetMarketplace(ctx context.Context) (map[string]any, error) {
 // ListEvalSchedules returns eval schedules.
 func (c *Client) ListEvalSchedules(ctx context.Context, projectID string) ([]map[string]any, error) {
 	var result []map[string]any
-	if err := c.doRequest(ctx, http.MethodGet, "/eval-schedules?projectId="+projectID, nil, &result); err != nil {
+	q := url.Values{}
+	q.Set("projectId", projectID)
+	if err := c.doRequest(ctx, http.MethodGet, "/eval-schedules?"+q.Encode(), nil, &result); err != nil {
 		return nil, fmt.Errorf("ListEvalSchedules: %w", err)
 	}
 	return result, nil
@@ -895,7 +977,9 @@ func (c *Client) ListEvalSchedules(ctx context.Context, projectID string) ([]map
 // ListIncidents returns incidents for a project.
 func (c *Client) ListIncidents(ctx context.Context, projectID string) ([]map[string]any, error) {
 	var result []map[string]any
-	if err := c.doRequest(ctx, http.MethodGet, "/incidents?projectId="+projectID, nil, &result); err != nil {
+	q := url.Values{}
+	q.Set("projectId", projectID)
+	if err := c.doRequest(ctx, http.MethodGet, "/incidents?"+q.Encode(), nil, &result); err != nil {
 		return nil, fmt.Errorf("ListIncidents: %w", err)
 	}
 	return result, nil
@@ -971,7 +1055,10 @@ func (c *Client) GenerateAISBOM(ctx context.Context, projectID string) (map[stri
 // Search performs a full-text search.
 func (c *Client) Search(ctx context.Context, projectID, query string) (map[string]any, error) {
 	var result map[string]any
-	if err := c.doRequest(ctx, http.MethodGet, "/search?projectId="+projectID+"&q="+query, nil, &result); err != nil {
+	q := url.Values{}
+	q.Set("projectId", projectID)
+	q.Set("q", query)
+	if err := c.doRequest(ctx, http.MethodGet, "/search?"+q.Encode(), nil, &result); err != nil {
 		return nil, fmt.Errorf("Search: %w", err)
 	}
 	return result, nil
@@ -989,55 +1076,85 @@ func (c *Client) ListTickets(ctx context.Context) (map[string]any, error) {
 // --- Internal HTTP plumbing ---
 
 func (c *Client) doRequest(ctx context.Context, method, path string, body any, target any) error {
-	var bodyReader io.Reader
+	var bodyData []byte
 	if body != nil {
-		data, err := json.Marshal(body)
+		var err error
+		bodyData, err = json.Marshal(body)
 		if err != nil {
 			return &EvalGuardError{Code: ErrCodeValidation, Message: fmt.Sprintf("failed to marshal request body: %v", err)}
 		}
-		bodyReader = bytes.NewReader(data)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, bodyReader)
-	if err != nil {
-		return &EvalGuardError{Code: ErrCodeNetworkFailure, Message: fmt.Sprintf("failed to create request: %v", err)}
-	}
-
-	req.Header.Set("Authorization", "Bearer "+c.apiKey)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", userAgent)
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			return &EvalGuardError{Code: ErrCodeTimeout, Message: "request timed out"}
-		}
-		return &EvalGuardError{Code: ErrCodeNetworkFailure, Message: fmt.Sprintf("request failed: %v", err)}
-	}
-	defer resp.Body.Close()
-
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return &EvalGuardError{Code: ErrCodeNetworkFailure, Message: fmt.Sprintf("failed to read response body: %v", err)}
-	}
-
-	requestID := resp.Header.Get("X-Request-ID")
-
-	if resp.StatusCode >= 400 {
-		return c.handleErrorResponse(resp, respBody, requestID)
-	}
-
-	if target != nil && len(respBody) > 0 {
-		if err := json.Unmarshal(respBody, target); err != nil {
-			return &EvalGuardError{
-				Code:      ErrCodeInternal,
-				Message:   fmt.Sprintf("failed to decode response: %v", err),
-				RequestID: requestID,
+	var lastErr error
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if attempt > 0 {
+			// Wait before retrying. For 429, use Retry-After; otherwise exponential backoff.
+			delay := baseRetryDelay * time.Duration(math.Pow(2, float64(attempt-1)))
+			if rateLimitErr, ok := lastErr.(*RateLimitError); ok {
+				delay = rateLimitErr.RetryAfter
+			}
+			select {
+			case <-ctx.Done():
+				return &EvalGuardError{Code: ErrCodeTimeout, Message: "request cancelled while waiting to retry"}
+			case <-time.After(delay):
 			}
 		}
+
+		var bodyReader io.Reader
+		if bodyData != nil {
+			bodyReader = bytes.NewReader(bodyData)
+		}
+
+		req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, bodyReader)
+		if err != nil {
+			return &EvalGuardError{Code: ErrCodeNetworkFailure, Message: fmt.Sprintf("failed to create request: %v", err)}
+		}
+
+		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("User-Agent", userAgent)
+
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			if ctx.Err() == context.DeadlineExceeded {
+				return &EvalGuardError{Code: ErrCodeTimeout, Message: "request timed out"}
+			}
+			lastErr = &EvalGuardError{Code: ErrCodeNetworkFailure, Message: fmt.Sprintf("request failed: %v", err)}
+			continue
+		}
+
+		respBody, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			lastErr = &EvalGuardError{Code: ErrCodeNetworkFailure, Message: fmt.Sprintf("failed to read response body: %v", err)}
+			continue
+		}
+
+		requestID := resp.Header.Get("X-Request-ID")
+
+		if resp.StatusCode >= 400 {
+			lastErr = c.handleErrorResponse(resp, respBody, requestID)
+			// Retry on 429 (rate limit) and 5xx (server errors)
+			if resp.StatusCode == 429 || resp.StatusCode >= 500 {
+				continue
+			}
+			// Non-retryable client errors (401, 403, 404, 422, etc.)
+			return lastErr
+		}
+
+		if target != nil && len(respBody) > 0 {
+			if err := json.Unmarshal(respBody, target); err != nil {
+				return &EvalGuardError{
+					Code:      ErrCodeInternal,
+					Message:   fmt.Sprintf("failed to decode response: %v", err),
+					RequestID: requestID,
+				}
+			}
+		}
+		return nil
 	}
-	return nil
+	return lastErr
 }
 
 func (c *Client) handleErrorResponse(resp *http.Response, body []byte, requestID string) error {
