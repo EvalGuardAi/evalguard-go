@@ -1374,6 +1374,174 @@ func (c *Client) DeleteTraceAttachment(ctx context.Context, traceID, attachmentI
 	return nil
 }
 
+// --- Agent-run metered billing (Gap #5) ---
+
+type StartAgentRunOpts struct {
+	APIKeyID       string                 `json:"apiKeyId,omitempty"`
+	EndCustomerID  string                 `json:"endCustomerId,omitempty"`
+	TraceID        string                 `json:"traceId,omitempty"`
+	Metadata       map[string]any         `json:"metadata,omitempty"`
+}
+
+type AgentRun struct {
+	RunID     string `json:"runId"`
+	Status    string `json:"status"`
+	StartedAt string `json:"startedAt"`
+}
+
+func (c *Client) StartAgentRun(ctx context.Context, opts StartAgentRunOpts) (*AgentRun, error) {
+	var wrap struct{ Data *AgentRun `json:"data"` }
+	if err := c.doRequest(ctx, http.MethodPost, "/agent-runs/start", opts, &wrap); err != nil {
+		return nil, fmt.Errorf("StartAgentRun: %w", err)
+	}
+	return wrap.Data, nil
+}
+
+type EndAgentRunOpts struct {
+	CostUSD   float64        `json:"costUsd"`
+	TokensIn  int            `json:"tokensIn,omitempty"`
+	TokensOut int            `json:"tokensOut,omitempty"`
+	Status    string         `json:"status,omitempty"`
+	Metadata  map[string]any `json:"metadata,omitempty"`
+}
+
+func (c *Client) EndAgentRun(ctx context.Context, runID string, opts EndAgentRunOpts) error {
+	path := fmt.Sprintf("/agent-runs/%s/end", url.PathEscape(runID))
+	if err := c.doRequest(ctx, http.MethodPost, path, opts, nil); err != nil {
+		return fmt.Errorf("EndAgentRun: %w", err)
+	}
+	return nil
+}
+
+type ListAgentRunsOpts struct {
+	APIKeyID       string
+	AgentTag       string
+	EndCustomerID  string
+	Since          string
+	Limit          int
+	GroupBy        string // "agent_tag" | "end_customer_id" | "api_key_id"
+}
+
+func (c *Client) ListAgentRuns(ctx context.Context, opts ListAgentRunsOpts) (map[string]any, error) {
+	q := url.Values{}
+	if opts.APIKeyID != "" { q.Set("apiKeyId", opts.APIKeyID) }
+	if opts.AgentTag != "" { q.Set("agentTag", opts.AgentTag) }
+	if opts.EndCustomerID != "" { q.Set("endCustomerId", opts.EndCustomerID) }
+	if opts.Since != "" { q.Set("since", opts.Since) }
+	if opts.Limit > 0 { q.Set("limit", fmt.Sprintf("%d", opts.Limit)) }
+	if opts.GroupBy != "" { q.Set("groupBy", opts.GroupBy) }
+	path := "/agent-runs"
+	if q.Encode() != "" { path += "?" + q.Encode() }
+	var wrap struct{ Data map[string]any `json:"data"` }
+	if err := c.doRequest(ctx, http.MethodGet, path, nil, &wrap); err != nil {
+		return nil, fmt.Errorf("ListAgentRuns: %w", err)
+	}
+	return wrap.Data, nil
+}
+
+// --- Model-scan governance (Gap #1) ---
+
+type PromoteModelScanOpts struct {
+	ToEnv    string `json:"toEnv"`
+	FromEnv  string `json:"fromEnv,omitempty"`
+	Override bool   `json:"override,omitempty"`
+	Reason   string `json:"reason,omitempty"`
+}
+
+func (c *Client) PromoteModelScan(ctx context.Context, scanID string, opts PromoteModelScanOpts) (map[string]any, error) {
+	path := fmt.Sprintf("/security/model-scan/%s/promote", url.PathEscape(scanID))
+	var wrap struct{ Data map[string]any `json:"data"` }
+	if err := c.doRequest(ctx, http.MethodPost, path, opts, &wrap); err != nil {
+		return nil, fmt.Errorf("PromoteModelScan: %w", err)
+	}
+	return wrap.Data, nil
+}
+
+// GetModelScanAttestation returns the CycloneDX-ML 1.6 attestation JSON for a scan.
+func (c *Client) GetModelScanAttestation(ctx context.Context, scanID string) (map[string]any, error) {
+	path := fmt.Sprintf("/security/model-scan/%s/attestation", url.PathEscape(scanID))
+	var wrap struct{ Data map[string]any `json:"data"` }
+	if err := c.doRequest(ctx, http.MethodGet, path, nil, &wrap); err != nil {
+		return nil, fmt.Errorf("GetModelScanAttestation: %w", err)
+	}
+	return wrap.Data, nil
+}
+
+// --- Shadow-AI discovery (Gap #2) ---
+
+func (c *Client) IngestShadowAISightings(ctx context.Context, source string, rows []map[string]any, projectID string) (map[string]any, error) {
+	body := map[string]any{"source": source, "rows": rows}
+	if projectID != "" { body["projectId"] = projectID }
+	var wrap struct{ Data map[string]any `json:"data"` }
+	if err := c.doRequest(ctx, http.MethodPost, "/shadow-ai/ingest", body, &wrap); err != nil {
+		return nil, fmt.Errorf("IngestShadowAISightings: %w", err)
+	}
+	return wrap.Data, nil
+}
+
+func (c *Client) SetShadowAIPolicy(ctx context.Context, domain, status, rationale, projectID string) error {
+	body := map[string]any{"domain": domain, "status": status}
+	if rationale != "" { body["rationale"] = rationale }
+	if projectID != "" { body["projectId"] = projectID }
+	if err := c.doRequest(ctx, http.MethodPost, "/shadow-ai/policy", body, nil); err != nil {
+		return fmt.Errorf("SetShadowAIPolicy: %w", err)
+	}
+	return nil
+}
+
+// --- SIEM inbound tokens (Gap #6) ---
+
+type CreateSiemInboundTokenOpts struct {
+	Source           string   `json:"source"`  // splunk | sentinel | qradar | generic_webhook
+	Label            string   `json:"label"`
+	AllowedActions   []string `json:"allowedActions,omitempty"`
+	RateLimitPerMin  int      `json:"rateLimitPerMin,omitempty"`
+	ProjectID        string   `json:"projectId,omitempty"`
+}
+
+// CreateSiemInboundToken mints a SIEM webhook HMAC token. The returned hmacSecret
+// in the "data.token" map is shown EXACTLY ONCE — save it into your SIEM now.
+func (c *Client) CreateSiemInboundToken(ctx context.Context, opts CreateSiemInboundTokenOpts) (map[string]any, error) {
+	var wrap struct{ Data map[string]any `json:"data"` }
+	if err := c.doRequest(ctx, http.MethodPost, "/siem/inbound/tokens", opts, &wrap); err != nil {
+		return nil, fmt.Errorf("CreateSiemInboundToken: %w", err)
+	}
+	return wrap.Data, nil
+}
+
+func (c *Client) RevokeSiemInboundToken(ctx context.Context, tokenID, projectID string) error {
+	q := url.Values{}
+	q.Set("id", tokenID)
+	q.Set("projectId", projectID)
+	path := "/siem/inbound/tokens?" + q.Encode()
+	if err := c.doRequest(ctx, http.MethodDelete, path, nil, nil); err != nil {
+		return fmt.Errorf("RevokeSiemInboundToken: %w", err)
+	}
+	return nil
+}
+
+// --- Debug agent (Gap #4) ---
+
+type AnalyzeTraceOpts struct {
+	TraceID          string                 `json:"traceId"`
+	ScorerResultIDs  []string               `json:"scorerResultIds,omitempty"`
+	AnalyzerModel    string                 `json:"analyzerModel,omitempty"`
+	AnalyzerProvider string                 `json:"analyzerProvider,omitempty"`
+	ExpectedOutput   string                 `json:"expectedOutput,omitempty"`
+	InlineContext    map[string]any         `json:"inlineContext,omitempty"`
+	ProjectID        string                 `json:"projectId,omitempty"`
+}
+
+// AnalyzeTrace asks the debug agent to analyze a failing trace. Returns a map
+// with sessionId, fixKind, confidence, rationale, suggestedFix, analyzerCostUsd.
+func (c *Client) AnalyzeTrace(ctx context.Context, opts AnalyzeTraceOpts) (map[string]any, error) {
+	var wrap struct{ Data map[string]any `json:"data"` }
+	if err := c.doRequest(ctx, http.MethodPost, "/debug-agent", opts, &wrap); err != nil {
+		return nil, fmt.Errorf("AnalyzeTrace: %w", err)
+	}
+	return wrap.Data, nil
+}
+
 // --- Internal HTTP plumbing ---
 
 func (c *Client) doRequest(ctx context.Context, method, path string, body any, target any) error {
