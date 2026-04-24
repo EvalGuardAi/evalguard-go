@@ -20,6 +20,7 @@ package evalguard
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -1071,6 +1072,306 @@ func (c *Client) ListTickets(ctx context.Context) (map[string]any, error) {
 		return nil, fmt.Errorf("ListTickets: %w", err)
 	}
 	return result, nil
+}
+
+// ─── Provider Keys (BYOK vault) ───────────────────────────────────────────
+//
+// Plaintext API keys are encrypted server-side via Supabase Vault envelope
+// encryption; responses never include the plaintext. See the SaaS docs at
+// https://evalguard.ai/docs/api#provider-keys for the security model.
+
+// ProviderKey is the safe metadata view of a stored provider key — never
+// contains plaintext or ciphertext. For identification, use KeyLast4.
+type ProviderKey struct {
+	ID        string  `json:"id"`
+	Provider  string  `json:"provider"`
+	ProjectID *string `json:"project_id,omitempty"`
+	Label     *string `json:"label,omitempty"`
+	KeyLast4  *string `json:"key_last4,omitempty"`
+	CreatedAt string  `json:"created_at"`
+	RotatedAt *string `json:"rotated_at,omitempty"`
+}
+
+type ListProviderKeysResponse struct {
+	Keys  []ProviderKey `json:"keys"`
+	Total int           `json:"total"`
+}
+
+type UpsertProviderKeyRequest struct {
+	OrgID     string  `json:"orgId"`
+	Provider  string  `json:"provider"`
+	APIKey    string  `json:"apiKey"`
+	ProjectID *string `json:"projectId,omitempty"`
+	Label     *string `json:"label,omitempty"`
+}
+
+type UpsertProviderKeyResponse struct {
+	Key     ProviderKey `json:"key"`
+	Rotated bool        `json:"rotated"`
+}
+
+// ListProviderKeys fetches metadata for all BYOK keys in the given org.
+func (c *Client) ListProviderKeys(ctx context.Context, orgID string, projectID *string) (*ListProviderKeysResponse, error) {
+	q := url.Values{}
+	q.Set("orgId", orgID)
+	if projectID != nil {
+		q.Set("projectId", *projectID)
+	}
+	var result ListProviderKeysResponse
+	if err := c.doRequest(ctx, http.MethodGet, "/provider-keys?"+q.Encode(), nil, &result); err != nil {
+		return nil, fmt.Errorf("ListProviderKeys: %w", err)
+	}
+	return &result, nil
+}
+
+// UpsertProviderKey creates a new BYOK key or rotates an existing one (if a
+// row already exists for the (org, project, provider) triple). The returned
+// `Rotated` flag indicates which path was taken.
+func (c *Client) UpsertProviderKey(ctx context.Context, req UpsertProviderKeyRequest) (*UpsertProviderKeyResponse, error) {
+	var result UpsertProviderKeyResponse
+	if err := c.doRequest(ctx, http.MethodPost, "/provider-keys", req, &result); err != nil {
+		return nil, fmt.Errorf("UpsertProviderKey: %w", err)
+	}
+	return &result, nil
+}
+
+// DeleteProviderKey revokes a BYOK key. The underlying vault.secrets row is
+// auto-cleaned by the DB trigger installed in migration 20260424.
+func (c *Client) DeleteProviderKey(ctx context.Context, orgID, keyID string) error {
+	q := url.Values{}
+	q.Set("orgId", orgID)
+	q.Set("id", keyID)
+	if err := c.doRequest(ctx, http.MethodDelete, "/provider-keys?"+q.Encode(), nil, nil); err != nil {
+		return fmt.Errorf("DeleteProviderKey: %w", err)
+	}
+	return nil
+}
+
+// ─── Models Registry (custom pricing overrides) ───────────────────────────
+
+type ModelRegistryEntry struct {
+	ID                   string  `json:"id"`
+	ModelName            string  `json:"model_name"`
+	Provider             *string `json:"provider,omitempty"`
+	DisplayName          *string `json:"display_name,omitempty"`
+	InputPricePer1MUSD   float64 `json:"input_price_per_1m_usd"`
+	OutputPricePer1MUSD  float64 `json:"output_price_per_1m_usd"`
+	ContextWindow        *int    `json:"context_window,omitempty"`
+	Notes                *string `json:"notes,omitempty"`
+	ProjectID            *string `json:"project_id,omitempty"`
+}
+
+type ListModelsResponse struct {
+	Models []ModelRegistryEntry `json:"models"`
+	Total  int                  `json:"total"`
+}
+
+type UpsertModelRequest struct {
+	OrgID                string  `json:"orgId"`
+	ModelName            string  `json:"modelName"`
+	InputPricePer1MUSD   float64 `json:"inputPricePer1mUsd"`
+	OutputPricePer1MUSD  float64 `json:"outputPricePer1mUsd"`
+	ProjectID            *string `json:"projectId,omitempty"`
+	Provider             *string `json:"provider,omitempty"`
+	DisplayName          *string `json:"displayName,omitempty"`
+	ContextWindow        *int    `json:"contextWindow,omitempty"`
+	Notes                *string `json:"notes,omitempty"`
+}
+
+// ListModels returns custom pricing overrides for the org (project-specific
+// + org-default rows interleaved).
+func (c *Client) ListModels(ctx context.Context, orgID string, projectID *string) (*ListModelsResponse, error) {
+	q := url.Values{}
+	q.Set("orgId", orgID)
+	if projectID != nil {
+		q.Set("projectId", *projectID)
+	}
+	var result ListModelsResponse
+	if err := c.doRequest(ctx, http.MethodGet, "/models/registry?"+q.Encode(), nil, &result); err != nil {
+		return nil, fmt.Errorf("ListModels: %w", err)
+	}
+	return &result, nil
+}
+
+// UpsertModel creates or updates a pricing override. Prices are in USD per
+// million tokens. Invalidates the server-side cost cache so new pricing
+// takes effect within 60 s.
+func (c *Client) UpsertModel(ctx context.Context, req UpsertModelRequest) (*ModelRegistryEntry, error) {
+	var result struct {
+		Model   ModelRegistryEntry `json:"model"`
+		Created bool               `json:"created"`
+	}
+	if err := c.doRequest(ctx, http.MethodPost, "/models/registry", req, &result); err != nil {
+		return nil, fmt.Errorf("UpsertModel: %w", err)
+	}
+	return &result.Model, nil
+}
+
+func (c *Client) DeleteModel(ctx context.Context, orgID, modelID string) error {
+	q := url.Values{}
+	q.Set("orgId", orgID)
+	q.Set("id", modelID)
+	if err := c.doRequest(ctx, http.MethodDelete, "/models/registry?"+q.Encode(), nil, nil); err != nil {
+		return fmt.Errorf("DeleteModel: %w", err)
+	}
+	return nil
+}
+
+// ─── API-key budget caps ──────────────────────────────────────────────────
+
+type APIKeyBudget struct {
+	KeyID                  string   `json:"keyId"`
+	Name                   string   `json:"name,omitempty"`
+	MonthlyBudgetUSD       *float64 `json:"monthlyBudgetUsd"`
+	CurrentPeriodSpentUSD  float64  `json:"currentPeriodSpentUsd"`
+	CurrentPeriodStartedAt string   `json:"currentPeriodStartedAt"`
+	RemainingUSD           *float64 `json:"remainingUsd,omitempty"`
+	PercentUsed            *float64 `json:"percentUsed,omitempty"`
+	StaleReset             bool     `json:"staleReset,omitempty"`
+}
+
+// GetAPIKeyBudget returns the current month's spend + cap + percentUsed for
+// a virtual API key. `staleReset: true` means a month rollover is pending
+// and the next gateway request will reset the counter to 0.
+func (c *Client) GetAPIKeyBudget(ctx context.Context, keyID string) (*APIKeyBudget, error) {
+	var result APIKeyBudget
+	path := fmt.Sprintf("/api-keys/%s/budget", url.PathEscape(keyID))
+	if err := c.doRequest(ctx, http.MethodGet, path, nil, &result); err != nil {
+		return nil, fmt.Errorf("GetAPIKeyBudget: %w", err)
+	}
+	return &result, nil
+}
+
+// SetAPIKeyBudget updates the monthly USD cap. Pass nil to remove the cap.
+// Returns 402 Payment Required from the gateway proxy once spend reaches
+// the cap (see /api/v1/gateway/proxy enforcement).
+func (c *Client) SetAPIKeyBudget(ctx context.Context, keyID string, monthlyBudgetUSD *float64) (*APIKeyBudget, error) {
+	body := map[string]any{"monthlyBudgetUsd": monthlyBudgetUSD}
+	var result APIKeyBudget
+	path := fmt.Sprintf("/api-keys/%s/budget", url.PathEscape(keyID))
+	if err := c.doRequest(ctx, http.MethodPatch, path, body, &result); err != nil {
+		return nil, fmt.Errorf("SetAPIKeyBudget: %w", err)
+	}
+	return &result, nil
+}
+
+func (c *Client) RemoveAPIKeyBudget(ctx context.Context, keyID string) error {
+	path := fmt.Sprintf("/api-keys/%s/budget", url.PathEscape(keyID))
+	if err := c.doRequest(ctx, http.MethodDelete, path, nil, nil); err != nil {
+		return fmt.Errorf("RemoveAPIKeyBudget: %w", err)
+	}
+	return nil
+}
+
+// ─── Trace attachments (inline blob storage) ──────────────────────────────
+
+type SpanAttachment struct {
+	ID        string                 `json:"id"`
+	SpanID    string                 `json:"span_id"`
+	Name      string                 `json:"name"`
+	MimeType  string                 `json:"mime_type"`
+	SizeBytes int                    `json:"size_bytes"`
+	Metadata  map[string]any         `json:"metadata"`
+	CreatedAt string                 `json:"created_at"`
+}
+
+type ListAttachmentsResponse struct {
+	Attachments []SpanAttachment `json:"attachments"`
+	Total       int              `json:"total"`
+}
+
+type UploadAttachmentRequest struct {
+	TraceID    string         `json:"-"`
+	ProjectID  string         `json:"projectId"`
+	SpanID     string         `json:"spanId"`
+	Name       string         `json:"name"`
+	MimeType   string         `json:"mimeType"`
+	// Data is the raw bytes to attach. Encoded to base64 on the wire.
+	Data       []byte         `json:"-"`
+	// DataBase64 is populated at send-time; clients usually leave it empty.
+	DataBase64 string         `json:"dataBase64,omitempty"`
+	Metadata   map[string]any `json:"metadata,omitempty"`
+}
+
+const maxAttachmentBytes = 1 << 20 // 1 MB — matches server-side CHECK constraint
+
+// ListTraceAttachments returns metadata for all attachments on the given
+// trace. Binary payload is fetched per-attachment via FetchTraceAttachment.
+func (c *Client) ListTraceAttachments(ctx context.Context, traceID, projectID string) (*ListAttachmentsResponse, error) {
+	q := url.Values{}
+	q.Set("projectId", projectID)
+	var result ListAttachmentsResponse
+	path := fmt.Sprintf("/traces/%s/attachments?%s", url.PathEscape(traceID), q.Encode())
+	if err := c.doRequest(ctx, http.MethodGet, path, nil, &result); err != nil {
+		return nil, fmt.Errorf("ListTraceAttachments: %w", err)
+	}
+	return &result, nil
+}
+
+// UploadTraceAttachment pushes a binary blob (image/audio/text/json/pdf) to
+// a specific span. Enforces the 1 MB limit client-side to avoid a wasted
+// round trip.
+func (c *Client) UploadTraceAttachment(ctx context.Context, req UploadAttachmentRequest) (*SpanAttachment, error) {
+	if len(req.Data) == 0 && req.DataBase64 == "" {
+		return nil, fmt.Errorf("UploadTraceAttachment: Data or DataBase64 is required")
+	}
+	if len(req.Data) > maxAttachmentBytes {
+		return nil, fmt.Errorf("UploadTraceAttachment: payload exceeds 1 MB (%d bytes)", len(req.Data))
+	}
+	if req.DataBase64 == "" && len(req.Data) > 0 {
+		req.DataBase64 = base64.StdEncoding.EncodeToString(req.Data)
+	}
+
+	var result struct {
+		Attachment SpanAttachment `json:"attachment"`
+	}
+	path := fmt.Sprintf("/traces/%s/attachments", url.PathEscape(req.TraceID))
+	if err := c.doRequest(ctx, http.MethodPost, path, req, &result); err != nil {
+		return nil, fmt.Errorf("UploadTraceAttachment: %w", err)
+	}
+	return &result.Attachment, nil
+}
+
+// FetchTraceAttachment downloads the raw bytes of an attachment.
+// The returned Content-Type corresponds to the stored mime_type.
+func (c *Client) FetchTraceAttachment(ctx context.Context, traceID, attachmentID, projectID string) ([]byte, string, error) {
+	q := url.Values{}
+	q.Set("projectId", projectID)
+	fullURL := c.baseURL + fmt.Sprintf("/traces/%s/attachments/%s?%s", url.PathEscape(traceID), url.PathEscape(attachmentID), q.Encode())
+	reqHTTP, err := http.NewRequestWithContext(ctx, http.MethodGet, fullURL, nil)
+	if err != nil {
+		return nil, "", fmt.Errorf("FetchTraceAttachment: %w", err)
+	}
+	reqHTTP.Header.Set("Authorization", "Bearer "+c.apiKey)
+	reqHTTP.Header.Set("Accept", "application/octet-stream")
+	reqHTTP.Header.Set("User-Agent", userAgent)
+
+	resp, err := c.httpClient.Do(reqHTTP)
+	if err != nil {
+		return nil, "", fmt.Errorf("FetchTraceAttachment: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, "", fmt.Errorf("FetchTraceAttachment: HTTP %d: %s", resp.StatusCode, string(body))
+	}
+	bytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, "", fmt.Errorf("FetchTraceAttachment: %w", err)
+	}
+	return bytes, resp.Header.Get("Content-Type"), nil
+}
+
+func (c *Client) DeleteTraceAttachment(ctx context.Context, traceID, attachmentID, projectID string) error {
+	q := url.Values{}
+	q.Set("projectId", projectID)
+	q.Set("id", attachmentID)
+	path := fmt.Sprintf("/traces/%s/attachments?%s", url.PathEscape(traceID), q.Encode())
+	if err := c.doRequest(ctx, http.MethodDelete, path, nil, nil); err != nil {
+		return fmt.Errorf("DeleteTraceAttachment: %w", err)
+	}
+	return nil
 }
 
 // --- Internal HTTP plumbing ---
