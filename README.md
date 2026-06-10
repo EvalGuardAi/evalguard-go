@@ -11,6 +11,11 @@ testing, and runtime guardrails.
 go get github.com/EvalGuardAi/evalguard-go@latest
 ```
 
+This module is mirrored to the public `EvalGuardAi/evalguard-go` repo (the
+internal monorepo where the SDK source lives is private). Tags on that
+public mirror cut releases via `proxy.golang.org` — see
+`.github/workflows/publish-go-sdk.yml` and `RELEASE.md`.
+
 ## Quick start
 
 ```go
@@ -21,27 +26,31 @@ import (
     "log"
     "time"
 
-    "github.com/EvalGuardAi/evalguard-go"
+    evalguard "github.com/EvalGuardAi/evalguard-go"
 )
 
 func main() {
     client, err := evalguard.NewClient("your-api-key",
-        evalguard.WithBaseURL("https://api.evalguard.ai"),
+        evalguard.WithBaseURL("https://evalguard.ai/api/v1"),
         evalguard.WithTimeout(30*time.Second),
     )
     if err != nil {
         log.Fatal(err)
     }
 
-    result, err := client.RunEval(context.Background(), &evalguard.RunEvalRequest{
-        DatasetID: "ds_abc123",
+    // RunEval starts an async run; poll GetEval(started.ID) for results.
+    started, err := client.RunEval(context.Background(), &evalguard.RunEvalRequest{
+        Name:      "regression-suite",
+        ProjectID: "proj_abc123",
         Model:     "gpt-4o",
-        Metrics:   []string{"accuracy", "toxicity", "relevance"},
+        Prompt:    "Answer concisely: {{input}}",
+        Cases:     []evalguard.EvalCase{{Input: "2+2?", ExpectedOutput: "4"}},
+        Scorers:   []string{"exact-match"},
     })
     if err != nil {
         log.Fatal(err)
     }
-    log.Printf("%+v", result)
+    log.Printf("started run %s (status=%s, %d tests)", started.ID, started.Status, started.TotalTests)
 }
 ```
 

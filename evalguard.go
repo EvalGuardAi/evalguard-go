@@ -3,23 +3,28 @@
 // Usage:
 //
 //	client, err := evalguard.NewClient("your-api-key",
-//		evalguard.WithBaseURL("https://api.evalguard.ai"),
+//		evalguard.WithBaseURL("https://evalguard.ai/api/v1"),
 //		evalguard.WithTimeout(30*time.Second),
 //	)
 //	if err != nil {
 //		log.Fatal(err)
 //	}
 //
-//	result, err := client.RunEval(ctx, &evalguard.RunEvalRequest{
-//		DatasetID: "ds_abc123",
-//		Model:     "gpt-4",
-//		Metrics:   []string{"accuracy", "toxicity", "relevance"},
+//	started, err := client.RunEval(ctx, &evalguard.RunEvalRequest{
+//		Name:      "regression-suite",
+//		ProjectID: "proj_abc123",
+//		Model:     "gpt-4o",
+//		Prompt:    "Answer concisely: {{input}}",
+//		Cases:     []evalguard.EvalCase{{Input: "2+2?", ExpectedOutput: "4"}},
+//		Scorers:   []string{"exact-match"},
 //	})
+//	// RunEval is async; poll client.GetEval(ctx, started.ID) for results.
 package evalguard
 
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -37,23 +42,23 @@ const (
 )
 
 const (
-	DefaultBaseURL = "https://api.evalguard.ai/v1"
+	DefaultBaseURL = "https://evalguard.ai/api/v1"
 	DefaultTimeout = 30 * time.Second
-	userAgent      = "evalguard-go/1.0.0"
+	userAgent      = "evalguard-go/1.1.0"
 )
 
 // ErrorCode represents categorized API error codes.
 type ErrorCode string
 
 const (
-	ErrCodeUnauthorized    ErrorCode = "UNAUTHORIZED"
-	ErrCodeForbidden       ErrorCode = "FORBIDDEN"
-	ErrCodeNotFound        ErrorCode = "NOT_FOUND"
-	ErrCodeRateLimit       ErrorCode = "RATE_LIMITED"
-	ErrCodeValidation      ErrorCode = "VALIDATION_ERROR"
-	ErrCodeInternal        ErrorCode = "INTERNAL_ERROR"
-	ErrCodeTimeout         ErrorCode = "TIMEOUT"
-	ErrCodeNetworkFailure  ErrorCode = "NETWORK_FAILURE"
+	ErrCodeUnauthorized   ErrorCode = "UNAUTHORIZED"
+	ErrCodeForbidden      ErrorCode = "FORBIDDEN"
+	ErrCodeNotFound       ErrorCode = "NOT_FOUND"
+	ErrCodeRateLimit      ErrorCode = "RATE_LIMITED"
+	ErrCodeValidation     ErrorCode = "VALIDATION_ERROR"
+	ErrCodeInternal       ErrorCode = "INTERNAL_ERROR"
+	ErrCodeTimeout        ErrorCode = "TIMEOUT"
+	ErrCodeNetworkFailure ErrorCode = "NETWORK_FAILURE"
 )
 
 // EvalGuardError is the base error type for all SDK errors.
@@ -127,73 +132,134 @@ func NewClient(apiKey string, opts ...Option) (*Client, error) {
 
 // --- Request / Response types ---
 
+// EvalCase is a single test case in an evaluation run.
+type EvalCase struct {
+	Input          string `json:"input"`
+	ExpectedOutput string `json:"expectedOutput,omitempty"`
+}
+
 // RunEvalRequest contains parameters for starting an evaluation run.
+// Mirrors createEvalSchema on POST /api/v1/evals (requiredRole editor):
+// at least one case and one scorer are required.
 type RunEvalRequest struct {
-	DatasetID   string            `json:"dataset_id"`
-	Model       string            `json:"model"`
-	Metrics     []string          `json:"metrics"`
-	PromptID    string            `json:"prompt_id,omitempty"`
-	Parameters  map[string]any    `json:"parameters,omitempty"`
-	Tags        map[string]string `json:"tags,omitempty"`
-	Concurrency int               `json:"concurrency,omitempty"`
+	Name      string     `json:"name"`
+	ProjectID string     `json:"projectId"`
+	Model     string     `json:"model"`
+	Prompt    string     `json:"prompt"`
+	Cases     []EvalCase `json:"cases"`
+	Scorers   []string   `json:"scorers"`
 }
 
-// EvalResult represents the outcome of an evaluation run.
+// EvalRunStarted is the 201 payload returned by RunEval. The run executes
+// asynchronously in the background; poll GetEval(ID) for results.
+type EvalRunStarted struct {
+	ID         string `json:"id"`
+	Status     string `json:"status"`
+	TotalTests int    `json:"totalTests"`
+	Model      string `json:"model"`
+	Message    string `json:"message"`
+}
+
+// EvalResult is a single eval-run row as returned by GetEval and ListEvals.
+// Score and CompletedAt are nil while the run is still in progress; Config
+// is the opaque run configuration ({prompt, cases, scorers}) preserved as
+// raw JSON. Duration is wall-clock milliseconds, set once the run finishes.
 type EvalResult struct {
-	ID          string            `json:"id"`
-	Status      string            `json:"status"`
-	DatasetID   string            `json:"dataset_id"`
-	Model       string            `json:"model"`
-	Metrics     map[string]float64 `json:"metrics"`
-	SampleCount int               `json:"sample_count"`
-	CreatedAt   time.Time         `json:"created_at"`
-	FinishedAt  *time.Time        `json:"finished_at,omitempty"`
-	Tags        map[string]string `json:"tags,omitempty"`
-	Error       string            `json:"error,omitempty"`
+	ID          string          `json:"id"`
+	Name        string          `json:"name"`
+	Model       string          `json:"model"`
+	Status      string          `json:"status"`
+	Score       *float64        `json:"score"`
+	Config      json.RawMessage `json:"config"`
+	CreatedAt   time.Time       `json:"created_at"`
+	CompletedAt *time.Time      `json:"completed_at,omitempty"`
+	Duration    *int            `json:"duration,omitempty"`
+	Error       *string         `json:"error,omitempty"`
 }
 
-// ListEvalsRequest contains filters for listing evaluations.
-type ListEvalsRequest struct {
-	DatasetID string `json:"dataset_id,omitempty"`
-	Model     string `json:"model,omitempty"`
-	Status    string `json:"status,omitempty"`
-	Limit     int    `json:"limit,omitempty"`
-	Offset    int    `json:"offset,omitempty"`
+// EvalScore is a single scorer's verdict for one executed test case.
+type EvalScore struct {
+	Score  float64 `json:"score"`
+	Passed bool    `json:"passed"`
+	Reason string  `json:"reason,omitempty"`
 }
 
-// ListEvalsResponse is a paginated list of evaluation results.
-type ListEvalsResponse struct {
-	Evals      []EvalResult `json:"evals"`
-	TotalCount int          `json:"total_count"`
-	HasMore    bool         `json:"has_more"`
+// EvalCaseResult is one executed test case in a finished eval run.
+type EvalCaseResult struct {
+	ID            string               `json:"id"`
+	TestCaseIndex int                  `json:"test_case_index"`
+	Input         string               `json:"input"`
+	Expected      *string              `json:"expected,omitempty"`
+	Output        string               `json:"output"`
+	Scores        map[string]EvalScore `json:"scores"`
+	Score         float64              `json:"score"`
+	LatencyMs     float64              `json:"latency_ms"`
+	Cost          float64              `json:"cost"`
+	Passed        bool                 `json:"passed"`
+}
+
+// EvalSummary aggregates a run's per-case results.
+type EvalSummary struct {
+	TotalCases   int     `json:"totalCases"`
+	PassedCases  int     `json:"passedCases"`
+	FailedCases  int     `json:"failedCases"`
+	PassRate     float64 `json:"passRate"`
+	AvgScore     float64 `json:"avgScore"`
+	TotalLatency float64 `json:"totalLatency"`
+	TotalCost    float64 `json:"totalCost"`
+}
+
+// EvalRunDetail is the full GetEval payload — the run row plus its executed
+// cases and aggregate summary, as returned by GET /api/v1/evals/{id}.
+type EvalRunDetail struct {
+	Run     EvalResult       `json:"run"`
+	Results []EvalCaseResult `json:"results"`
+	Summary EvalSummary      `json:"summary"`
 }
 
 // SecurityScanRequest contains parameters for a security scan.
+//
+// The server's POST /api/v1/security route validates the body with
+// createSecurityScanSchema, which REQUIRES projectId (UUID), model,
+// prompt (a single non-empty string), and attackTypes (1..50 entries).
+// The previous DTO sent {prompts, scan_types, severity} which the schema
+// rejected with 400 VALIDATION_ERROR on every call — the scan never ran.
 type SecurityScanRequest struct {
-	Prompts     []string `json:"prompts"`
-	Model       string   `json:"model,omitempty"`
-	ScanTypes   []string `json:"scan_types,omitempty"`
-	Severity    string   `json:"severity,omitempty"`
+	// ProjectID is the UUID of the project the scan belongs to (required).
+	ProjectID string `json:"projectId"`
+	// Model is the target model identifier, e.g. "gpt-4o" (required).
+	Model string `json:"model"`
+	// Prompt is the single prompt/system instruction to attack (required).
+	Prompt string `json:"prompt"`
+	// AttackTypes is the list of attack categories to exercise, e.g.
+	// ["prompt-injection", "jailbreak"] (1..50 entries, required).
+	AttackTypes []string `json:"attackTypes"`
 }
 
-// SecurityFinding represents a single finding from a security scan.
-type SecurityFinding struct {
-	ID          string  `json:"id"`
-	Type        string  `json:"type"`
-	Severity    string  `json:"severity"`
-	Description string  `json:"description"`
-	Prompt      string  `json:"prompt"`
-	Score       float64 `json:"score"`
-	Remediation string  `json:"remediation,omitempty"`
+// SecuritySeverityCounts is the per-severity finding tally returned by a scan.
+type SecuritySeverityCounts struct {
+	Critical int `json:"critical"`
+	High     int `json:"high"`
+	Medium   int `json:"medium"`
+	Low      int `json:"low"`
 }
 
-// SecurityScanResult is the output of a security scan.
+// SecurityScanResult is the output of a synchronous security scan.
+//
+// POST /api/v1/security runs the scan inline and returns 201 with this
+// summary (route.ts apiSuccess at lines 400-416): the scan row id, its
+// terminal status, the aggregate safety score, the number of tests run,
+// the wall-clock duration, the per-severity counts, and the total finding
+// count. Individual findings are not inlined in this response — fetch them
+// via the scan detail endpoint by ID.
 type SecurityScanResult struct {
-	ID        string            `json:"id"`
-	Status    string            `json:"status"`
-	Findings  []SecurityFinding `json:"findings"`
-	Summary   map[string]int    `json:"summary"`
-	CreatedAt time.Time         `json:"created_at"`
+	ID             string                 `json:"id"`
+	Status         string                 `json:"status"`
+	Score          float64                `json:"score"`
+	TotalTests     int                    `json:"totalTests"`
+	Duration       float64                `json:"duration"`
+	SeverityCounts SecuritySeverityCounts `json:"severityCounts"`
+	FindingsCount  int                    `json:"findingsCount"`
 }
 
 // Trace represents a single observability trace.
@@ -230,9 +296,9 @@ type GetTracesResponse struct {
 
 // CreateDatasetRequest contains parameters for creating a dataset.
 type CreateDatasetRequest struct {
-	Name        string           `json:"name"`
-	Description string           `json:"description,omitempty"`
-	Items       []DatasetItem    `json:"items,omitempty"`
+	Name        string            `json:"name"`
+	Description string            `json:"description,omitempty"`
+	Items       []DatasetItem     `json:"items,omitempty"`
 	Tags        map[string]string `json:"tags,omitempty"`
 }
 
@@ -256,37 +322,69 @@ type Dataset struct {
 
 // --- API methods ---
 
-// RunEval starts an evaluation run and returns the result.
-func (c *Client) RunEval(ctx context.Context, req *RunEvalRequest) (*EvalResult, error) {
-	var result EvalResult
+// RunEval starts an asynchronous evaluation run.
+//
+// POST /api/v1/evals creates the run and fires background execution,
+// returning 201 immediately with the new run's ID and status "running".
+// The run does NOT finish before this call returns — poll GetEval(ID)
+// for status, score, and results.
+func (c *Client) RunEval(ctx context.Context, req *RunEvalRequest) (*EvalRunStarted, error) {
+	var result EvalRunStarted
 	if err := c.doRequest(ctx, http.MethodPost, "/evals", req, &result); err != nil {
 		return nil, fmt.Errorf("RunEval: %w", err)
 	}
 	return &result, nil
 }
 
-// GetEval retrieves an evaluation by ID.
-func (c *Client) GetEval(ctx context.Context, evalID string) (*EvalResult, error) {
-	var result EvalResult
+// GetEval retrieves a single eval run by ID. GET /api/v1/evals/{id}.
+func (c *Client) GetEval(ctx context.Context, evalID string) (*EvalRunDetail, error) {
+	var result EvalRunDetail
 	if err := c.doRequest(ctx, http.MethodGet, "/evals/"+evalID, nil, &result); err != nil {
 		return nil, fmt.Errorf("GetEval: %w", err)
 	}
 	return &result, nil
 }
 
-// ListEvals returns a paginated list of evaluations.
-func (c *Client) ListEvals(ctx context.Context, req *ListEvalsRequest) (*ListEvalsResponse, error) {
-	var result ListEvalsResponse
-	if err := c.doRequest(ctx, http.MethodGet, "/evals", req, &result); err != nil {
+// ListEvals returns the eval runs for a project, newest first.
+// GET /api/v1/evals?projectId=... — projectId is required and the
+// response payload is a bare array of run rows.
+func (c *Client) ListEvals(ctx context.Context, projectID string) ([]EvalResult, error) {
+	if projectID == "" {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "ListEvals: projectID is required"}
+	}
+	var result []EvalResult
+	q := url.Values{}
+	q.Set("projectId", projectID)
+	if err := c.doRequest(ctx, http.MethodGet, "/evals?"+q.Encode(), nil, &result); err != nil {
 		return nil, fmt.Errorf("ListEvals: %w", err)
 	}
-	return &result, nil
+	return result, nil
 }
 
-// RunSecurityScan starts a security scan against prompts.
+// RunSecurityScan runs a security scan synchronously and returns its summary.
+//
+// The server validates projectId/model/prompt/attackTypes before running;
+// we validate the same invariants client-side so callers get an actionable
+// error instead of an opaque 400 from the wire.
 func (c *Client) RunSecurityScan(ctx context.Context, req *SecurityScanRequest) (*SecurityScanResult, error) {
+	if req == nil {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "RunSecurityScan: req is required"}
+	}
+	if req.ProjectID == "" {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "RunSecurityScan: ProjectID is required"}
+	}
+	if req.Model == "" {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "RunSecurityScan: Model is required"}
+	}
+	if req.Prompt == "" {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "RunSecurityScan: Prompt is required"}
+	}
+	if len(req.AttackTypes) == 0 {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "RunSecurityScan: at least one AttackType is required"}
+	}
 	var result SecurityScanResult
-	if err := c.doRequest(ctx, http.MethodPost, "/security/scan", req, &result); err != nil {
+	// Security scans are created at POST /security (there is no /security/scan).
+	if err := c.doRequest(ctx, http.MethodPost, "/security", req, &result); err != nil {
 		return nil, fmt.Errorf("RunSecurityScan: %w", err)
 	}
 	return &result, nil
@@ -310,6 +408,156 @@ func (c *Client) CreateDataset(ctx context.Context, req *CreateDatasetRequest) (
 	return &result, nil
 }
 
+// --- Dataset versioning (Phase 6b, 2026-05-22) ---
+//
+// Immutable per-dataset snapshots for reproducible evals. Same surface
+// as Python/Java/Node SDKs. Returns map[string]any rather than typed
+// DTOs so the contract can evolve quickly; callers cast keys they need.
+
+// ListDatasetVersions returns immutable snapshots for a dataset, newest first.
+func (c *Client) ListDatasetVersions(ctx context.Context, datasetID string) (map[string]any, error) {
+	var result map[string]any
+	path := fmt.Sprintf("/datasets/%s/versions", datasetID)
+	if err := c.doRequest(ctx, http.MethodGet, path, nil, &result); err != nil {
+		return nil, fmt.Errorf("ListDatasetVersions: %w", err)
+	}
+	return result, nil
+}
+
+// SnapshotDataset records the dataset's current cases as a new immutable
+// version. Returns {unchanged: true, version} when content hash matches
+// the latest version (no new row written).
+//
+// description is optional; pass "" to skip.
+func (c *Client) SnapshotDataset(ctx context.Context, datasetID, description string) (map[string]any, error) {
+	var result map[string]any
+	body := map[string]any{}
+	if description != "" {
+		body["description"] = description
+	}
+	path := fmt.Sprintf("/datasets/%s/versions", datasetID)
+	if err := c.doRequest(ctx, http.MethodPost, path, body, &result); err != nil {
+		return nil, fmt.Errorf("SnapshotDataset: %w", err)
+	}
+	return result, nil
+}
+
+// GetDatasetVersion fetches a single snapshot including its inline cases payload.
+func (c *Client) GetDatasetVersion(ctx context.Context, datasetID, versionID string) (map[string]any, error) {
+	var result map[string]any
+	path := fmt.Sprintf("/datasets/%s/versions/%s", datasetID, versionID)
+	if err := c.doRequest(ctx, http.MethodGet, path, nil, &result); err != nil {
+		return nil, fmt.Errorf("GetDatasetVersion: %w", err)
+	}
+	return result, nil
+}
+
+// RestoreDatasetVersion restores a dataset to a frozen version. The
+// endpoint auto-snapshots the pre-restore state first so the operation
+// is reversible. Returns {restoredFromVersion, caseCount, preRestoreVersionNum}.
+func (c *Client) RestoreDatasetVersion(ctx context.Context, datasetID, versionID string) (map[string]any, error) {
+	var result map[string]any
+	path := fmt.Sprintf("/datasets/%s/versions/%s/restore", datasetID, versionID)
+	if err := c.doRequest(ctx, http.MethodPost, path, map[string]any{}, &result); err != nil {
+		return nil, fmt.Errorf("RestoreDatasetVersion: %w", err)
+	}
+	return result, nil
+}
+
+// DiffDatasetVersions returns added/removed/modified/unchanged counts +
+// the first-10 sample changes between two snapshots of the same dataset.
+func (c *Client) DiffDatasetVersions(ctx context.Context, datasetID, fromVersionID, toVersionID string) (map[string]any, error) {
+	var result map[string]any
+	path := fmt.Sprintf("/datasets/%s/versions/%s/diff?to=%s", datasetID, fromVersionID, toVersionID)
+	if err := c.doRequest(ctx, http.MethodGet, path, nil, &result); err != nil {
+		return nil, fmt.Errorf("DiffDatasetVersions: %w", err)
+	}
+	return result, nil
+}
+
+// ── Evaluator Hub (versioned, reusable evaluator registry) ──────────
+//
+// Arize-parity registry: one row per (project, name, version), content-hash
+// deduped. Mirrors the TS/Python SDKs + the `evalguard evaluators` CLI.
+
+// ListEvaluators returns evaluator versions for a project (newest first).
+// Pass name="" for all evaluators, or a name for one evaluator's full history.
+func (c *Client) ListEvaluators(ctx context.Context, projectID, name string) (map[string]any, error) {
+	if projectID == "" {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "projectID is required"}
+	}
+	var result map[string]any
+	q := url.Values{}
+	q.Set("projectId", projectID)
+	if name != "" {
+		q.Set("name", name)
+	}
+	if err := c.doRequest(ctx, http.MethodGet, "/evaluators?"+q.Encode(), nil, &result); err != nil {
+		return nil, fmt.Errorf("ListEvaluators: %w", err)
+	}
+	return result, nil
+}
+
+// CreateEvaluatorRequest is the body for CreateEvaluator. Definition is
+// {"kind": "llm-judge"|"code"|"heuristic"|"composite", "config": {...}, "threshold": float}.
+type CreateEvaluatorRequest struct {
+	ProjectID  string         `json:"projectId"`
+	Name       string         `json:"name"`
+	Definition map[string]any `json:"definition"`
+	Notes      string         `json:"notes,omitempty"`
+	Activate   *bool          `json:"activate,omitempty"`
+}
+
+// CreateEvaluator creates a new evaluator version (content-hash deduped against the latest).
+func (c *Client) CreateEvaluator(ctx context.Context, req *CreateEvaluatorRequest) (map[string]any, error) {
+	var result map[string]any
+	if err := c.doRequest(ctx, http.MethodPost, "/evaluators", req, &result); err != nil {
+		return nil, fmt.Errorf("CreateEvaluator: %w", err)
+	}
+	return result, nil
+}
+
+// DiffEvaluatorVersions returns the field-level diff between two versions of a named evaluator.
+func (c *Client) DiffEvaluatorVersions(ctx context.Context, projectID, name string, fromVersion, toVersion int) (map[string]any, error) {
+	var result map[string]any
+	body := map[string]any{
+		"projectId":   projectID,
+		"name":        name,
+		"fromVersion": fromVersion,
+		"toVersion":   toVersion,
+	}
+	if err := c.doRequest(ctx, http.MethodPost, "/evaluators/diff", body, &result); err != nil {
+		return nil, fmt.Errorf("DiffEvaluatorVersions: %w", err)
+	}
+	return result, nil
+}
+
+// ── Scorer calibration (CLHF — continuous learning from human feedback) ──
+
+// CalibrateScorerRequest is the body for CalibrateScorer. Provide Pairs
+// ([{"human": bool, "machine": bool}]) and/or Scored
+// ([{"humanPass": bool, "machineScore": float}]).
+type CalibrateScorerRequest struct {
+	Pairs            []map[string]bool `json:"pairs,omitempty"`
+	Scored           []map[string]any  `json:"scored,omitempty"`
+	ProjectID        string            `json:"projectId,omitempty"`
+	ScorerID         string            `json:"scorerId,omitempty"`
+	CurrentThreshold *float64          `json:"currentThreshold,omitempty"`
+}
+
+// CalibrateScorer quantifies evaluator/human agreement (chance-corrected
+// Cohen's kappa) and recommends the best score threshold.
+func (c *Client) CalibrateScorer(ctx context.Context, req *CalibrateScorerRequest) (map[string]any, error) {
+	if len(req.Pairs) == 0 && len(req.Scored) == 0 {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "CalibrateScorer: provide at least one of Pairs or Scored"}
+	}
+	var result map[string]any
+	if err := c.doRequest(ctx, http.MethodPost, "/scorers/calibrate", req, &result); err != nil {
+		return nil, fmt.Errorf("CalibrateScorer: %w", err)
+	}
+	return result, nil
+}
+
 // --- Shadow AI ---
 
 // ShadowAIRequest contains parameters for shadow AI analysis.
@@ -321,9 +569,9 @@ type ShadowAIRequest struct {
 
 // ShadowAIResult is the output of a shadow AI analysis.
 type ShadowAIResult struct {
-	Event              map[string]any `json:"event"`
-	PIIDetails         map[string]any `json:"piiDetails"`
-	SensitiveDetails   map[string]any `json:"sensitiveDataDetails"`
+	Event            map[string]any `json:"event"`
+	PIIDetails       map[string]any `json:"piiDetails"`
+	SensitiveDetails map[string]any `json:"sensitiveDataDetails"`
 }
 
 // AnalyzeShadowAI analyzes input for shadow AI risks (PII, credentials, unauthorized models).
@@ -339,14 +587,14 @@ func (c *Client) AnalyzeShadowAI(ctx context.Context, req *ShadowAIRequest) (*Sh
 
 // AIPosture represents the AI security posture.
 type AIPosture struct {
-	OverallScore          int            `json:"overallScore"`
-	TotalModels           int            `json:"totalModels"`
-	CriticalModels        int            `json:"criticalModels"`
-	TotalMisconfigurations int           `json:"totalMisconfigurations"`
-	DataFlows             int            `json:"dataFlows"`
-	CrossBorderFlows      int            `json:"crossBorderFlows"`
-	RiskDistribution      map[string]int `json:"riskDistribution"`
-	Recommendations       []string       `json:"recommendations"`
+	OverallScore           int            `json:"overallScore"`
+	TotalModels            int            `json:"totalModels"`
+	CriticalModels         int            `json:"criticalModels"`
+	TotalMisconfigurations int            `json:"totalMisconfigurations"`
+	DataFlows              int            `json:"dataFlows"`
+	CrossBorderFlows       int            `json:"crossBorderFlows"`
+	RiskDistribution       map[string]int `json:"riskDistribution"`
+	Recommendations        []string       `json:"recommendations"`
 }
 
 // AIPostureResult is the full AI-SPM response.
@@ -501,6 +749,71 @@ func (c *Client) ListPrompts(ctx context.Context, projectID string) ([]map[strin
 }
 
 // --- Firewall ---
+
+// FirewallCheckRequest is the body for POST /firewall/check.
+//
+// Input is the prompt or content to scan. Rules optionally narrows the
+// detection categories (e.g. ["prompt-injection", "jailbreak"]); when nil
+// or empty, all built-in layers run. ProjectID, when set, lets the server
+// apply tenant-scoped overrides (custom patterns, allowlists). Subject /
+// SubjectEmail are used by the consent gate when the call is made on
+// behalf of an end user; both are optional.
+type FirewallCheckRequest struct {
+	Input        string   `json:"input"`
+	Rules        []string `json:"rules,omitempty"`
+	ProjectID    string   `json:"projectId,omitempty"`
+	Subject      string   `json:"subject,omitempty"`
+	SubjectEmail string   `json:"subject_email,omitempty"`
+	SubjectID    string   `json:"subject_id,omitempty"`
+}
+
+// FirewallLayerHit reports a single detection-layer trigger from a scan.
+// Layer is one of "pattern", "token", "semantic", "output", "multi-turn".
+type FirewallLayerHit struct {
+	Layer     string  `json:"layer"`
+	Details   string  `json:"details,omitempty"`
+	Score     float64 `json:"score"`
+	LatencyMs float64 `json:"latencyMs"`
+}
+
+// FirewallCheckResponse is the typed response from POST /firewall/check.
+//
+// Blocked is true when the firewall has decided the input must not pass
+// through (either via ensemble threshold or one of the forceBlockCategories).
+// Score is the normalized 0..1 confidence. Category/Subcategory are the
+// classifier verdicts; both are empty strings when no layer triggered.
+// Hits is the per-layer breakdown of any triggered layers — an empty
+// slice means the input scored below all thresholds.
+type FirewallCheckResponse struct {
+	Blocked     bool               `json:"blocked"`
+	Score       float64            `json:"score"`
+	Category    string             `json:"category,omitempty"`
+	Subcategory string             `json:"subcategory,omitempty"`
+	LatencyMs   float64            `json:"latencyMs"`
+	Hits        []FirewallLayerHit `json:"hits,omitempty"`
+}
+
+// CheckFirewall runs a single input through the firewall engine.
+//
+// This is the customer-facing one-shot check — every gateway proxy call
+// exercises the same engine inline, but customers also need to call it
+// directly from CI / pre-deploy hooks / rule-authoring tools.
+//
+// Closes finding H17 (Go SDK) from the 2026-05-07 audit: the Go SDK
+// previously only had ListFirewallRules and could not actually invoke
+// the firewall — Go customers had no way to call the marketed runtime
+// detection. This method fills that gap with typed request/response
+// structs (no map[string]any).
+func (c *Client) CheckFirewall(ctx context.Context, req *FirewallCheckRequest) (*FirewallCheckResponse, error) {
+	if req == nil || req.Input == "" {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "CheckFirewall: req.Input is required"}
+	}
+	var result FirewallCheckResponse
+	if err := c.doRequest(ctx, http.MethodPost, "/firewall/check", req, &result); err != nil {
+		return nil, fmt.Errorf("CheckFirewall: %w", err)
+	}
+	return &result, nil
+}
 
 // ListFirewallRules returns all firewall rules for a project.
 func (c *Client) ListFirewallRules(ctx context.Context, projectID string) ([]map[string]any, error) {
@@ -1150,15 +1463,15 @@ func (c *Client) DeleteProviderKey(ctx context.Context, orgID, keyID string) err
 // ─── Models Registry (custom pricing overrides) ───────────────────────────
 
 type ModelRegistryEntry struct {
-	ID                   string  `json:"id"`
-	ModelName            string  `json:"model_name"`
-	Provider             *string `json:"provider,omitempty"`
-	DisplayName          *string `json:"display_name,omitempty"`
-	InputPricePer1MUSD   float64 `json:"input_price_per_1m_usd"`
-	OutputPricePer1MUSD  float64 `json:"output_price_per_1m_usd"`
-	ContextWindow        *int    `json:"context_window,omitempty"`
-	Notes                *string `json:"notes,omitempty"`
-	ProjectID            *string `json:"project_id,omitempty"`
+	ID                  string  `json:"id"`
+	ModelName           string  `json:"model_name"`
+	Provider            *string `json:"provider,omitempty"`
+	DisplayName         *string `json:"display_name,omitempty"`
+	InputPricePer1MUSD  float64 `json:"input_price_per_1m_usd"`
+	OutputPricePer1MUSD float64 `json:"output_price_per_1m_usd"`
+	ContextWindow       *int    `json:"context_window,omitempty"`
+	Notes               *string `json:"notes,omitempty"`
+	ProjectID           *string `json:"project_id,omitempty"`
 }
 
 type ListModelsResponse struct {
@@ -1167,15 +1480,15 @@ type ListModelsResponse struct {
 }
 
 type UpsertModelRequest struct {
-	OrgID                string  `json:"orgId"`
-	ModelName            string  `json:"modelName"`
-	InputPricePer1MUSD   float64 `json:"inputPricePer1mUsd"`
-	OutputPricePer1MUSD  float64 `json:"outputPricePer1mUsd"`
-	ProjectID            *string `json:"projectId,omitempty"`
-	Provider             *string `json:"provider,omitempty"`
-	DisplayName          *string `json:"displayName,omitempty"`
-	ContextWindow        *int    `json:"contextWindow,omitempty"`
-	Notes                *string `json:"notes,omitempty"`
+	OrgID               string  `json:"orgId"`
+	ModelName           string  `json:"modelName"`
+	InputPricePer1MUSD  float64 `json:"inputPricePer1mUsd"`
+	OutputPricePer1MUSD float64 `json:"outputPricePer1mUsd"`
+	ProjectID           *string `json:"projectId,omitempty"`
+	Provider            *string `json:"provider,omitempty"`
+	DisplayName         *string `json:"displayName,omitempty"`
+	ContextWindow       *int    `json:"contextWindow,omitempty"`
+	Notes               *string `json:"notes,omitempty"`
 }
 
 // ListModels returns custom pricing overrides for the org (project-specific
@@ -1266,13 +1579,13 @@ func (c *Client) RemoveAPIKeyBudget(ctx context.Context, keyID string) error {
 // ─── Trace attachments (inline blob storage) ──────────────────────────────
 
 type SpanAttachment struct {
-	ID        string                 `json:"id"`
-	SpanID    string                 `json:"span_id"`
-	Name      string                 `json:"name"`
-	MimeType  string                 `json:"mime_type"`
-	SizeBytes int                    `json:"size_bytes"`
-	Metadata  map[string]any         `json:"metadata"`
-	CreatedAt string                 `json:"created_at"`
+	ID        string         `json:"id"`
+	SpanID    string         `json:"span_id"`
+	Name      string         `json:"name"`
+	MimeType  string         `json:"mime_type"`
+	SizeBytes int            `json:"size_bytes"`
+	Metadata  map[string]any `json:"metadata"`
+	CreatedAt string         `json:"created_at"`
 }
 
 type ListAttachmentsResponse struct {
@@ -1281,13 +1594,13 @@ type ListAttachmentsResponse struct {
 }
 
 type UploadAttachmentRequest struct {
-	TraceID    string         `json:"-"`
-	ProjectID  string         `json:"projectId"`
-	SpanID     string         `json:"spanId"`
-	Name       string         `json:"name"`
-	MimeType   string         `json:"mimeType"`
+	TraceID   string `json:"-"`
+	ProjectID string `json:"projectId"`
+	SpanID    string `json:"spanId"`
+	Name      string `json:"name"`
+	MimeType  string `json:"mimeType"`
 	// Data is the raw bytes to attach. Encoded to base64 on the wire.
-	Data       []byte         `json:"-"`
+	Data []byte `json:"-"`
 	// DataBase64 is populated at send-time; clients usually leave it empty.
 	DataBase64 string         `json:"dataBase64,omitempty"`
 	Metadata   map[string]any `json:"metadata,omitempty"`
@@ -1377,10 +1690,10 @@ func (c *Client) DeleteTraceAttachment(ctx context.Context, traceID, attachmentI
 // --- Agent-run metered billing (Gap #5) ---
 
 type StartAgentRunOpts struct {
-	APIKeyID       string                 `json:"apiKeyId,omitempty"`
-	EndCustomerID  string                 `json:"endCustomerId,omitempty"`
-	TraceID        string                 `json:"traceId,omitempty"`
-	Metadata       map[string]any         `json:"metadata,omitempty"`
+	APIKeyID      string         `json:"apiKeyId,omitempty"`
+	EndCustomerID string         `json:"endCustomerId,omitempty"`
+	TraceID       string         `json:"traceId,omitempty"`
+	Metadata      map[string]any `json:"metadata,omitempty"`
 }
 
 type AgentRun struct {
@@ -1390,11 +1703,11 @@ type AgentRun struct {
 }
 
 func (c *Client) StartAgentRun(ctx context.Context, opts StartAgentRunOpts) (*AgentRun, error) {
-	var wrap struct{ Data *AgentRun `json:"data"` }
-	if err := c.doRequest(ctx, http.MethodPost, "/agent-runs/start", opts, &wrap); err != nil {
+	var result AgentRun
+	if err := c.doRequest(ctx, http.MethodPost, "/agent-runs/start", opts, &result); err != nil {
 		return nil, fmt.Errorf("StartAgentRun: %w", err)
 	}
-	return wrap.Data, nil
+	return &result, nil
 }
 
 type EndAgentRunOpts struct {
@@ -1414,29 +1727,43 @@ func (c *Client) EndAgentRun(ctx context.Context, runID string, opts EndAgentRun
 }
 
 type ListAgentRunsOpts struct {
-	APIKeyID       string
-	AgentTag       string
-	EndCustomerID  string
-	Since          string
-	Limit          int
-	GroupBy        string // "agent_tag" | "end_customer_id" | "api_key_id"
+	APIKeyID      string
+	AgentTag      string
+	EndCustomerID string
+	Since         string
+	Limit         int
+	GroupBy       string // "agent_tag" | "end_customer_id" | "api_key_id"
 }
 
 func (c *Client) ListAgentRuns(ctx context.Context, opts ListAgentRunsOpts) (map[string]any, error) {
 	q := url.Values{}
-	if opts.APIKeyID != "" { q.Set("apiKeyId", opts.APIKeyID) }
-	if opts.AgentTag != "" { q.Set("agentTag", opts.AgentTag) }
-	if opts.EndCustomerID != "" { q.Set("endCustomerId", opts.EndCustomerID) }
-	if opts.Since != "" { q.Set("since", opts.Since) }
-	if opts.Limit > 0 { q.Set("limit", fmt.Sprintf("%d", opts.Limit)) }
-	if opts.GroupBy != "" { q.Set("groupBy", opts.GroupBy) }
+	if opts.APIKeyID != "" {
+		q.Set("apiKeyId", opts.APIKeyID)
+	}
+	if opts.AgentTag != "" {
+		q.Set("agentTag", opts.AgentTag)
+	}
+	if opts.EndCustomerID != "" {
+		q.Set("endCustomerId", opts.EndCustomerID)
+	}
+	if opts.Since != "" {
+		q.Set("since", opts.Since)
+	}
+	if opts.Limit > 0 {
+		q.Set("limit", fmt.Sprintf("%d", opts.Limit))
+	}
+	if opts.GroupBy != "" {
+		q.Set("groupBy", opts.GroupBy)
+	}
 	path := "/agent-runs"
-	if q.Encode() != "" { path += "?" + q.Encode() }
-	var wrap struct{ Data map[string]any `json:"data"` }
-	if err := c.doRequest(ctx, http.MethodGet, path, nil, &wrap); err != nil {
+	if q.Encode() != "" {
+		path += "?" + q.Encode()
+	}
+	var result map[string]any
+	if err := c.doRequest(ctx, http.MethodGet, path, nil, &result); err != nil {
 		return nil, fmt.Errorf("ListAgentRuns: %w", err)
 	}
-	return wrap.Data, nil
+	return result, nil
 }
 
 // --- Model-scan governance (Gap #1) ---
@@ -1450,39 +1777,45 @@ type PromoteModelScanOpts struct {
 
 func (c *Client) PromoteModelScan(ctx context.Context, scanID string, opts PromoteModelScanOpts) (map[string]any, error) {
 	path := fmt.Sprintf("/security/model-scan/%s/promote", url.PathEscape(scanID))
-	var wrap struct{ Data map[string]any `json:"data"` }
-	if err := c.doRequest(ctx, http.MethodPost, path, opts, &wrap); err != nil {
+	var result map[string]any
+	if err := c.doRequest(ctx, http.MethodPost, path, opts, &result); err != nil {
 		return nil, fmt.Errorf("PromoteModelScan: %w", err)
 	}
-	return wrap.Data, nil
+	return result, nil
 }
 
 // GetModelScanAttestation returns the CycloneDX-ML 1.6 attestation JSON for a scan.
 func (c *Client) GetModelScanAttestation(ctx context.Context, scanID string) (map[string]any, error) {
 	path := fmt.Sprintf("/security/model-scan/%s/attestation", url.PathEscape(scanID))
-	var wrap struct{ Data map[string]any `json:"data"` }
-	if err := c.doRequest(ctx, http.MethodGet, path, nil, &wrap); err != nil {
+	var result map[string]any
+	if err := c.doRequest(ctx, http.MethodGet, path, nil, &result); err != nil {
 		return nil, fmt.Errorf("GetModelScanAttestation: %w", err)
 	}
-	return wrap.Data, nil
+	return result, nil
 }
 
 // --- Shadow-AI discovery (Gap #2) ---
 
 func (c *Client) IngestShadowAISightings(ctx context.Context, source string, rows []map[string]any, projectID string) (map[string]any, error) {
 	body := map[string]any{"source": source, "rows": rows}
-	if projectID != "" { body["projectId"] = projectID }
-	var wrap struct{ Data map[string]any `json:"data"` }
-	if err := c.doRequest(ctx, http.MethodPost, "/shadow-ai/ingest", body, &wrap); err != nil {
+	if projectID != "" {
+		body["projectId"] = projectID
+	}
+	var result map[string]any
+	if err := c.doRequest(ctx, http.MethodPost, "/shadow-ai/ingest", body, &result); err != nil {
 		return nil, fmt.Errorf("IngestShadowAISightings: %w", err)
 	}
-	return wrap.Data, nil
+	return result, nil
 }
 
 func (c *Client) SetShadowAIPolicy(ctx context.Context, domain, status, rationale, projectID string) error {
 	body := map[string]any{"domain": domain, "status": status}
-	if rationale != "" { body["rationale"] = rationale }
-	if projectID != "" { body["projectId"] = projectID }
+	if rationale != "" {
+		body["rationale"] = rationale
+	}
+	if projectID != "" {
+		body["projectId"] = projectID
+	}
 	if err := c.doRequest(ctx, http.MethodPost, "/shadow-ai/policy", body, nil); err != nil {
 		return fmt.Errorf("SetShadowAIPolicy: %w", err)
 	}
@@ -1492,21 +1825,21 @@ func (c *Client) SetShadowAIPolicy(ctx context.Context, domain, status, rational
 // --- SIEM inbound tokens (Gap #6) ---
 
 type CreateSiemInboundTokenOpts struct {
-	Source           string   `json:"source"`  // splunk | sentinel | qradar | generic_webhook
-	Label            string   `json:"label"`
-	AllowedActions   []string `json:"allowedActions,omitempty"`
-	RateLimitPerMin  int      `json:"rateLimitPerMin,omitempty"`
-	ProjectID        string   `json:"projectId,omitempty"`
+	Source          string   `json:"source"` // splunk | sentinel | qradar | generic_webhook
+	Label           string   `json:"label"`
+	AllowedActions  []string `json:"allowedActions,omitempty"`
+	RateLimitPerMin int      `json:"rateLimitPerMin,omitempty"`
+	ProjectID       string   `json:"projectId,omitempty"`
 }
 
 // CreateSiemInboundToken mints a SIEM webhook HMAC token. The returned hmacSecret
 // in the "data.token" map is shown EXACTLY ONCE — save it into your SIEM now.
 func (c *Client) CreateSiemInboundToken(ctx context.Context, opts CreateSiemInboundTokenOpts) (map[string]any, error) {
-	var wrap struct{ Data map[string]any `json:"data"` }
-	if err := c.doRequest(ctx, http.MethodPost, "/siem/inbound/tokens", opts, &wrap); err != nil {
+	var result map[string]any
+	if err := c.doRequest(ctx, http.MethodPost, "/siem/inbound/tokens", opts, &result); err != nil {
 		return nil, fmt.Errorf("CreateSiemInboundToken: %w", err)
 	}
-	return wrap.Data, nil
+	return result, nil
 }
 
 func (c *Client) RevokeSiemInboundToken(ctx context.Context, tokenID, projectID string) error {
@@ -1523,26 +1856,57 @@ func (c *Client) RevokeSiemInboundToken(ctx context.Context, tokenID, projectID 
 // --- Debug agent (Gap #4) ---
 
 type AnalyzeTraceOpts struct {
-	TraceID          string                 `json:"traceId"`
-	ScorerResultIDs  []string               `json:"scorerResultIds,omitempty"`
-	AnalyzerModel    string                 `json:"analyzerModel,omitempty"`
-	AnalyzerProvider string                 `json:"analyzerProvider,omitempty"`
-	ExpectedOutput   string                 `json:"expectedOutput,omitempty"`
-	InlineContext    map[string]any         `json:"inlineContext,omitempty"`
-	ProjectID        string                 `json:"projectId,omitempty"`
+	TraceID          string         `json:"traceId"`
+	ScorerResultIDs  []string       `json:"scorerResultIds,omitempty"`
+	AnalyzerModel    string         `json:"analyzerModel,omitempty"`
+	AnalyzerProvider string         `json:"analyzerProvider,omitempty"`
+	ExpectedOutput   string         `json:"expectedOutput,omitempty"`
+	InlineContext    map[string]any `json:"inlineContext,omitempty"`
+	ProjectID        string         `json:"projectId,omitempty"`
 }
 
 // AnalyzeTrace asks the debug agent to analyze a failing trace. Returns a map
 // with sessionId, fixKind, confidence, rationale, suggestedFix, analyzerCostUsd.
 func (c *Client) AnalyzeTrace(ctx context.Context, opts AnalyzeTraceOpts) (map[string]any, error) {
-	var wrap struct{ Data map[string]any `json:"data"` }
-	if err := c.doRequest(ctx, http.MethodPost, "/debug-agent", opts, &wrap); err != nil {
+	var result map[string]any
+	if err := c.doRequest(ctx, http.MethodPost, "/debug-agent", opts, &result); err != nil {
 		return nil, fmt.Errorf("AnalyzeTrace: %w", err)
 	}
-	return wrap.Data, nil
+	return result, nil
 }
 
 // --- Internal HTTP plumbing ---
+
+// newIdempotencyKey returns a random RFC-4122 v4 UUID string. Used as the
+// per-call Idempotency-Key so that retries of a non-idempotent POST/PUT/PATCH
+// are deduplicated server-side (idempotency.ts keys on the `idempotency-key`
+// header) instead of creating duplicate scans/runs and double-billing.
+func newIdempotencyKey() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// crypto/rand should never fail; fall back to a time-seeded value so
+		// retries within a single call still share one key (the goal here).
+		nano := time.Now().UnixNano()
+		for i := 0; i < 8; i++ {
+			b[i] = byte(nano >> (8 * i))
+		}
+	}
+	b[6] = (b[6] & 0x0f) | 0x40 // version 4
+	b[8] = (b[8] & 0x3f) | 0x80 // variant 10
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
+// isUnsafeMethod reports whether a method mutates server state, so a retry
+// must carry a stable Idempotency-Key to avoid duplicate side effects. GET
+// and DELETE are naturally idempotent and need no key.
+func isUnsafeMethod(method string) bool {
+	switch method {
+	case http.MethodPost, http.MethodPut, http.MethodPatch:
+		return true
+	default:
+		return false
+	}
+}
 
 func (c *Client) doRequest(ctx context.Context, method, path string, body any, target any) error {
 	var bodyData []byte
@@ -1552,6 +1916,15 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body any, t
 		if err != nil {
 			return &EvalGuardError{Code: ErrCodeValidation, Message: fmt.Sprintf("failed to marshal request body: %v", err)}
 		}
+	}
+
+	// Generate ONE Idempotency-Key per logical call (not per attempt) so the
+	// retry loop below reuses it across every retry of an unsafe method. A
+	// transient 502/network blip then dedups to a single server-side scan/run
+	// instead of double-charging the customer.
+	var idempotencyKey string
+	if isUnsafeMethod(method) {
+		idempotencyKey = newIdempotencyKey()
 	}
 
 	var lastErr error
@@ -1583,6 +1956,10 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body any, t
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Accept", "application/json")
 		req.Header.Set("User-Agent", userAgent)
+		if idempotencyKey != "" {
+			// Same key on every attempt → server dedups the retry.
+			req.Header.Set("Idempotency-Key", idempotencyKey)
+		}
 
 		resp, err := c.httpClient.Do(req)
 		if err != nil {
@@ -1613,7 +1990,7 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body any, t
 		}
 
 		if target != nil && len(respBody) > 0 {
-			if err := json.Unmarshal(respBody, target); err != nil {
+			if err := unmarshalEnvelope(respBody, target); err != nil {
 				return &EvalGuardError{
 					Code:      ErrCodeInternal,
 					Message:   fmt.Sprintf("failed to decode response: %v", err),
@@ -1626,15 +2003,46 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body any, t
 	return lastErr
 }
 
+// unmarshalEnvelope decodes the standard EvalGuard API response envelope
+// ({ "success": bool, "data": T }) into target by unwrapping "data". Every v1
+// route replies through apiSuccess(data), so the typed result lives under
+// "data" — unmarshalling the whole body into a typed struct left every field
+// zero-valued. If the body has no "data" field (legacy / non-enveloped servers
+// or a bare array), it falls back to decoding the whole body so callers still
+// work. This is the single place the envelope is stripped; per-method handlers
+// pass their plain result target.
+func unmarshalEnvelope(body []byte, target any) error {
+	var env struct {
+		Data json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(body, &env); err == nil && len(env.Data) > 0 && string(env.Data) != "null" {
+		return json.Unmarshal(env.Data, target)
+	}
+	return json.Unmarshal(body, target)
+}
+
 func (c *Client) handleErrorResponse(resp *http.Response, body []byte, requestID string) error {
 	statusCode := resp.StatusCode
+	// The EvalGuard API error envelope nests the reason under "error":
+	//   { "success": false, "error": { "message": ..., "code": ... } }
+	// (apiError in apps/web/src/lib/api.ts). Reading top-level "message"
+	// therefore always came back empty → every error surfaced as the
+	// generic HTTP status text. Read the nested field first, then fall
+	// back to a top-level "message" (legacy / non-enveloped bodies).
 	var apiErr struct {
+		Error struct {
+			Message string `json:"message"`
+			Code    string `json:"code"`
+		} `json:"error"`
 		Message string `json:"message"`
 		Code    string `json:"code"`
 	}
 	_ = json.Unmarshal(body, &apiErr)
 
-	msg := apiErr.Message
+	msg := apiErr.Error.Message
+	if msg == "" {
+		msg = apiErr.Message
+	}
 	if msg == "" {
 		msg = http.StatusText(statusCode)
 	}
