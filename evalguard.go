@@ -1312,7 +1312,7 @@ func (c *Client) GetDashboardStats(ctx context.Context) (map[string]any, error) 
 func (c *Client) DetectDrift(ctx context.Context, baselineRunID, currentRunID string) (map[string]any, error) {
 	body := map[string]any{"baselineRunId": baselineRunID, "currentRunId": currentRunID}
 	var result map[string]any
-	if err := c.doRequest(ctx, http.MethodPost, "/drift/detect", body, &result); err != nil {
+	if err := c.doRequest(ctx, http.MethodPost, "/monitoring/drift/detect", body, &result); err != nil {
 		return nil, fmt.Errorf("DetectDrift: %w", err)
 	}
 	return result, nil
