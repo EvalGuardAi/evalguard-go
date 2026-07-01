@@ -482,11 +482,15 @@ func (c *Client) DiffDatasetVersions(ctx context.Context, datasetID, fromVersion
 
 // ListEvaluators returns evaluator versions for a project (newest first).
 // Pass name="" for all evaluators, or a name for one evaluator's full history.
-func (c *Client) ListEvaluators(ctx context.Context, projectID, name string) (map[string]any, error) {
+func (c *Client) ListEvaluators(ctx context.Context, projectID, name string) ([]map[string]any, error) {
 	if projectID == "" {
 		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "projectID is required"}
 	}
-	var result map[string]any
+	// GET /evaluators returns a JSON ARRAY of evaluator_versions under `data`
+	// (apiSuccess(data) where data is a Supabase .select("*") result), so the
+	// result must be a slice — decoding into map[string]any always failed with
+	// "cannot unmarshal array into Go value of type map[string]interface{}".
+	var result []map[string]any
 	q := url.Values{}
 	q.Set("projectId", projectID)
 	if name != "" {
