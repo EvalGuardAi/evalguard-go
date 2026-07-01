@@ -487,7 +487,14 @@ func TestEvaluatorHubMethods(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"ok":true}`))
+		// GET /evaluators (list) returns a JSON ARRAY under data — matching the real
+		// API (apiSuccess of a Supabase .select("*") result). Other evaluator ops
+		// (create POST, diff) return objects.
+		if r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/evaluators") && !strings.Contains(r.URL.Path, "/diff") {
+			_, _ = w.Write([]byte(`{"success":true,"data":[{"id":"ev1","name":"faithfulness","version":1}]}`))
+		} else {
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		}
 	}))
 	defer srv.Close()
 
