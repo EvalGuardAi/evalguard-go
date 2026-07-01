@@ -33,6 +33,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"sync"
 	"time"
 )
 
@@ -44,7 +45,11 @@ const (
 const (
 	DefaultBaseURL = "https://evalguard.ai/api/v1"
 	DefaultTimeout = 30 * time.Second
-	userAgent      = "evalguard-go/1.1.0"
+	userAgent      = "evalguard-go/1.2.0"
+	// clientVersion is sent as x-evalguard-client-version on every request so an
+	// org that pins allowed client versions can enforce its policy on this SDK
+	// (deep-audit 2026-06-21). Keep in lockstep with userAgent above.
+	clientVersion = "1.2.0"
 )
 
 // ErrorCode represents categorized API error codes.
@@ -110,6 +115,13 @@ type Client struct {
 	apiKey     string
 	baseURL    string
 	httpClient *http.Client
+
+	// resolvedProjectID caches the default project resolved from
+	// GET /project/current the first time a project-scoped method is called
+	// without an explicit projectId. projectMu guards the cache so repeated
+	// calls across goroutines resolve at most once.
+	projectMu         sync.Mutex
+	resolvedProjectID string
 }
 
 // NewClient creates a new EvalGuard client.
@@ -262,51 +274,78 @@ type SecurityScanResult struct {
 	FindingsCount  int                    `json:"findingsCount"`
 }
 
-// Trace represents a single observability trace.
+// Trace represents a single observability trace SUMMARY as returned by
+// GET /api/v1/traces. The fields mirror the server's aggregated row exactly
+// (dbRowToSummary in apps/web/src/app/api/v1/traces/route.ts):
+// { traceId, rootSpanName, duration, spanCount, services, status, startTime }.
+//
+// The previous struct used snake_case fields (id/parent_id/name/start_time/
+// duration_ms/tokens_in/…) that the API never emits, so EVERY trace decoded to
+// an all-zero struct. StartTime/Duration are epoch/ms numbers (not RFC3339),
+// matching the server, so they're plain int64s here.
 type Trace struct {
-	ID         string         `json:"id"`
-	ParentID   string         `json:"parent_id,omitempty"`
-	Name       string         `json:"name"`
-	Input      any            `json:"input"`
-	Output     any            `json:"output"`
-	Metadata   map[string]any `json:"metadata,omitempty"`
-	StartTime  time.Time      `json:"start_time"`
-	EndTime    time.Time      `json:"end_time"`
-	DurationMs float64        `json:"duration_ms"`
-	TokensIn   int            `json:"tokens_in"`
-	TokensOut  int            `json:"tokens_out"`
-	CostUSD    float64        `json:"cost_usd"`
+	// TraceID is the trace's id (groups all spans).
+	TraceID string `json:"traceId"`
+	// RootSpanName is the name of the root span (the entry point).
+	RootSpanName string `json:"rootSpanName"`
+	// Duration is the wall-clock span of the trace in milliseconds
+	// (max end_time_ms − min start_time_ms across its spans).
+	Duration int64 `json:"duration"`
+	// SpanCount is the number of spans in the trace.
+	SpanCount int `json:"spanCount"`
+	// Services is the distinct set of service.name values seen in the trace.
+	Services []string `json:"services"`
+	// Status is "ok" | "error" | "unset" — "error" if any span errored.
+	Status string `json:"status"`
+	// StartTime is the trace's earliest span start, epoch milliseconds.
+	StartTime int64 `json:"startTime"`
 }
 
-// GetTracesRequest contains filters for listing traces.
+// GetTracesRequest contains filters for listing traces. These are sent as
+// QUERY PARAMETERS (GET /api/v1/traces?projectId=...&...), not a JSON body —
+// the API reads request.nextUrl.searchParams. ProjectID is REQUIRED (the API
+// returns 400 "projectId is required" without it).
 type GetTracesRequest struct {
-	StartTime time.Time `json:"start_time,omitempty"`
-	EndTime   time.Time `json:"end_time,omitempty"`
-	Model     string    `json:"model,omitempty"`
-	Limit     int       `json:"limit,omitempty"`
-	Offset    int       `json:"offset,omitempty"`
+	ProjectID   string    // required
+	StartTime   time.Time // matched against start_time_ms (sent as epoch millis)
+	EndTime     time.Time
+	Model       string
+	ServiceName string
+	Status      string // "ok" | "error" | "unset"
+	Cursor      string // opaque keyset cursor from a prior NextCursor
+	Limit       int
+	Offset      int // legacy offset pagination (prefer Cursor)
 }
 
-// GetTracesResponse is a paginated list of traces.
+// GetTracesResponse is a paginated list of traces. Field names match the API
+// envelope's data object: { traces, total, nextCursor }.
 type GetTracesResponse struct {
 	Traces     []Trace `json:"traces"`
-	TotalCount int     `json:"total_count"`
-	HasMore    bool    `json:"has_more"`
+	Total      int     `json:"total"`
+	NextCursor string  `json:"nextCursor"`
 }
 
-// CreateDatasetRequest contains parameters for creating a dataset.
+// HasMore reports whether another page is available (a non-empty keyset cursor).
+func (r *GetTracesResponse) HasMore() bool { return r.NextCursor != "" }
+
+// CreateDatasetRequest contains parameters for creating a dataset. Matches the
+// POST /api/v1/datasets body: ProjectID is REQUIRED (a UUID), rows live under
+// "cases" (not "items"), and "source" is an optional origin tag (default
+// "manual" server-side). The previous struct sent {name,items,tags} with no
+// projectId and 400'd on every call.
 type CreateDatasetRequest struct {
-	Name        string            `json:"name"`
-	Description string            `json:"description,omitempty"`
-	Items       []DatasetItem     `json:"items,omitempty"`
-	Tags        map[string]string `json:"tags,omitempty"`
+	Name        string        `json:"name"`
+	ProjectID   string        `json:"projectId"`
+	Description string        `json:"description,omitempty"`
+	Source      string        `json:"source,omitempty"`
+	Cases       []DatasetItem `json:"cases,omitempty"`
 }
 
 // DatasetItem represents a single row in a dataset.
 type DatasetItem struct {
-	Input          string `json:"input"`
-	ExpectedOutput string `json:"expected_output,omitempty"`
-	Context        string `json:"context,omitempty"`
+	Input          string         `json:"input"`
+	ExpectedOutput string         `json:"expectedOutput,omitempty"`
+	Metadata       map[string]any `json:"metadata,omitempty"`
 }
 
 // Dataset represents a stored dataset.
@@ -320,6 +359,43 @@ type Dataset struct {
 	UpdatedAt   time.Time         `json:"updated_at"`
 }
 
+// --- Project auto-resolution ---
+
+// projectCurrent is the raw payload of GET /api/v1/project/current. The
+// endpoint returns this object UNWRAPPED (not under the {success,data}
+// envelope); unmarshalEnvelope's fallback decodes the whole body for us.
+type projectCurrent struct {
+	ProjectID string `json:"projectId"`
+	OrgID     string `json:"orgId"`
+}
+
+// resolveProjectID returns the caller's default project id, fetching it from
+// GET /api/v1/project/current the first time and caching it on the client so
+// subsequent calls don't re-fetch. On a fresh org the endpoint auto-creates a
+// default project. It errors if no project could be resolved so callers see an
+// actionable message instead of a downstream 400.
+func (c *Client) resolveProjectID(ctx context.Context) (string, error) {
+	c.projectMu.Lock()
+	defer c.projectMu.Unlock()
+	if c.resolvedProjectID != "" {
+		return c.resolvedProjectID, nil
+	}
+
+	var pc projectCurrent
+	if err := c.doRequest(ctx, http.MethodGet, "/project/current", nil, &pc); err != nil {
+		return "", fmt.Errorf("resolveProjectID: %w", err)
+	}
+	if pc.ProjectID == "" {
+		return "", &EvalGuardError{
+			Code:    ErrCodeValidation,
+			Message: "could not resolve a default project; pass projectId explicitly",
+		}
+	}
+
+	c.resolvedProjectID = pc.ProjectID
+	return c.resolvedProjectID, nil
+}
+
 // --- API methods ---
 
 // RunEval starts an asynchronous evaluation run.
@@ -329,6 +405,18 @@ type Dataset struct {
 // The run does NOT finish before this call returns — poll GetEval(ID)
 // for status, score, and results.
 func (c *Client) RunEval(ctx context.Context, req *RunEvalRequest) (*EvalRunStarted, error) {
+	if req == nil {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "RunEval: req is required"}
+	}
+	// When the caller omits projectId, resolve (and cache) the default project.
+	// An explicitly-set ProjectID always wins and skips the lookup.
+	if req.ProjectID == "" {
+		pid, err := c.resolveProjectID(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("RunEval: %w", err)
+		}
+		req.ProjectID = pid
+	}
 	var result EvalRunStarted
 	if err := c.doRequest(ctx, http.MethodPost, "/evals", req, &result); err != nil {
 		return nil, fmt.Errorf("RunEval: %w", err)
@@ -349,8 +437,14 @@ func (c *Client) GetEval(ctx context.Context, evalID string) (*EvalRunDetail, er
 // GET /api/v1/evals?projectId=... — projectId is required and the
 // response payload is a bare array of run rows.
 func (c *Client) ListEvals(ctx context.Context, projectID string) ([]EvalResult, error) {
+	// When the caller omits projectID, resolve (and cache) the default project.
+	// An explicitly-passed projectID always wins and skips the lookup.
 	if projectID == "" {
-		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "ListEvals: projectID is required"}
+		pid, err := c.resolveProjectID(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("ListEvals: %w", err)
+		}
+		projectID = pid
 	}
 	var result []EvalResult
 	q := url.Values{}
@@ -370,8 +464,14 @@ func (c *Client) RunSecurityScan(ctx context.Context, req *SecurityScanRequest) 
 	if req == nil {
 		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "RunSecurityScan: req is required"}
 	}
+	// When the caller omits projectId, resolve (and cache) the default project.
+	// An explicitly-set ProjectID always wins and skips the lookup.
 	if req.ProjectID == "" {
-		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "RunSecurityScan: ProjectID is required"}
+		pid, err := c.resolveProjectID(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("RunSecurityScan: %w", err)
+		}
+		req.ProjectID = pid
 	}
 	if req.Model == "" {
 		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "RunSecurityScan: Model is required"}
@@ -390,10 +490,56 @@ func (c *Client) RunSecurityScan(ctx context.Context, req *SecurityScanRequest) 
 	return &result, nil
 }
 
-// GetTraces retrieves observability traces.
+// GetTraces retrieves observability traces. Filters are sent as query
+// parameters (the API reads searchParams); the previous implementation
+// json-marshalled them into a GET body that the server ignored, so every
+// filter was silently dropped and results came back wrong/empty.
 func (c *Client) GetTraces(ctx context.Context, req *GetTracesRequest) (*GetTracesResponse, error) {
+	if req == nil {
+		return nil, fmt.Errorf("GetTraces: req is required")
+	}
+	// projectId is required server-side (400 without it). When the caller omits it,
+	// resolve (and cache) the default project, mirroring RunEval/ListEvals.
+	if req.ProjectID == "" {
+		pid, err := c.resolveProjectID(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("GetTraces: %w", err)
+		}
+		req.ProjectID = pid
+	}
+	q := url.Values{}
+	q.Set("projectId", req.ProjectID)
+	if !req.StartTime.IsZero() {
+		q.Set("startTime", strconv.FormatInt(req.StartTime.UnixMilli(), 10))
+	}
+	if !req.EndTime.IsZero() {
+		q.Set("endTime", strconv.FormatInt(req.EndTime.UnixMilli(), 10))
+	}
+	if req.Model != "" {
+		q.Set("model", req.Model)
+	}
+	if req.ServiceName != "" {
+		q.Set("serviceName", req.ServiceName)
+	}
+	if req.Status != "" {
+		q.Set("status", req.Status)
+	}
+	if req.Cursor != "" {
+		q.Set("cursor", req.Cursor)
+	}
+	if req.Limit > 0 {
+		q.Set("limit", strconv.Itoa(req.Limit))
+	}
+	if req.Offset > 0 {
+		q.Set("offset", strconv.Itoa(req.Offset))
+	}
+	path := "/traces"
+	if enc := q.Encode(); enc != "" {
+		path += "?" + enc
+	}
+
 	var result GetTracesResponse
-	if err := c.doRequest(ctx, http.MethodGet, "/traces", req, &result); err != nil {
+	if err := c.doRequest(ctx, http.MethodGet, path, nil, &result); err != nil {
 		return nil, fmt.Errorf("GetTraces: %w", err)
 	}
 	return &result, nil
@@ -482,14 +628,15 @@ func (c *Client) DiffDatasetVersions(ctx context.Context, datasetID, fromVersion
 
 // ListEvaluators returns evaluator versions for a project (newest first).
 // Pass name="" for all evaluators, or a name for one evaluator's full history.
+//
+// GET /api/v1/evaluators replies with apiSuccess(data) where data is a BARE
+// ARRAY of evaluator-version rows. The previous map[string]any target left the
+// result nil/empty on every call because the envelope's "data" is a JSON array,
+// not an object — json.Unmarshal of [] into a map is a no-op.
 func (c *Client) ListEvaluators(ctx context.Context, projectID, name string) ([]map[string]any, error) {
 	if projectID == "" {
 		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "projectID is required"}
 	}
-	// GET /evaluators returns a JSON ARRAY of evaluator_versions under `data`
-	// (apiSuccess(data) where data is a Supabase .select("*") result), so the
-	// result must be a slice — decoding into map[string]any always failed with
-	// "cannot unmarshal array into Go value of type map[string]interface{}".
 	var result []map[string]any
 	q := url.Values{}
 	q.Set("projectId", projectID)
@@ -894,15 +1041,25 @@ func (c *Client) ListTeam(ctx context.Context, orgID string) ([]map[string]any, 
 	return result, nil
 }
 
+// AuditLogsResponse is the data payload of GET /api/v1/audit-logs — the API
+// returns apiSuccess({ logs, total }), NOT a bare array. The previous
+// []map[string]any target unmarshalled the {logs,total} OBJECT into a slice
+// (a no-op), so callers always got nil. Logs holds the page of rows; Total is
+// the (estimated) full count for pagination.
+type AuditLogsResponse struct {
+	Logs  []map[string]any `json:"logs"`
+	Total int              `json:"total"`
+}
+
 // GetAuditLogs returns audit logs for an organization.
-func (c *Client) GetAuditLogs(ctx context.Context, orgID string) ([]map[string]any, error) {
-	var result []map[string]any
+func (c *Client) GetAuditLogs(ctx context.Context, orgID string) (*AuditLogsResponse, error) {
+	var result AuditLogsResponse
 	q := url.Values{}
 	q.Set("orgId", orgID)
 	if err := c.doRequest(ctx, http.MethodGet, "/audit-logs?"+q.Encode(), nil, &result); err != nil {
 		return nil, fmt.Errorf("GetAuditLogs: %w", err)
 	}
-	return result, nil
+	return &result, nil
 }
 
 // --- Formal Verification ---
@@ -1125,9 +1282,10 @@ func (c *Client) GetMonitoringSLA(ctx context.Context, projectID string) (map[st
 
 // --- Compliance (extended) ---
 
-// GetCompliance returns compliance status.
-func (c *Client) GetCompliance(ctx context.Context, orgID string) (map[string]any, error) {
-	var result map[string]any
+// GetCompliance returns the org's compliance assessments (newest first). The
+// server replies with a bare array of assessment rows, not an object.
+func (c *Client) GetCompliance(ctx context.Context, orgID string) ([]map[string]any, error) {
+	var result []map[string]any
 	q := url.Values{}
 	q.Set("orgId", orgID)
 	if err := c.doRequest(ctx, http.MethodGet, "/compliance?"+q.Encode(), nil, &result); err != nil {
@@ -1254,22 +1412,33 @@ func (c *Client) GetSettings(ctx context.Context, projectID string) (map[string]
 	return result, nil
 }
 
-// ListNotifications returns user notifications.
-func (c *Client) ListNotifications(ctx context.Context) ([]map[string]any, error) {
-	var result []map[string]any
+// ListNotifications returns the current user's notifications plus the unread
+// count. The server replies with an object {notifications, unread_count}.
+func (c *Client) ListNotifications(ctx context.Context) (map[string]any, error) {
+	var result map[string]any
 	if err := c.doRequest(ctx, http.MethodGet, "/notifications", nil, &result); err != nil {
 		return nil, fmt.Errorf("ListNotifications: %w", err)
 	}
 	return result, nil
 }
 
+// TemplatesResponse is the data payload of GET /api/v1/templates — the API
+// returns apiSuccess({ templates, count }), NOT a bare array. The previous
+// []map[string]any target unmarshalled the {templates,count} OBJECT into a
+// slice (a no-op), so callers always got nil. Templates holds the rows; Count
+// is the number of templates returned.
+type TemplatesResponse struct {
+	Templates []map[string]any `json:"templates"`
+	Count     int              `json:"count"`
+}
+
 // ListTemplates returns available eval templates.
-func (c *Client) ListTemplates(ctx context.Context) ([]map[string]any, error) {
-	var result []map[string]any
+func (c *Client) ListTemplates(ctx context.Context) (*TemplatesResponse, error) {
+	var result TemplatesResponse
 	if err := c.doRequest(ctx, http.MethodGet, "/templates", nil, &result); err != nil {
 		return nil, fmt.Errorf("ListTemplates: %w", err)
 	}
-	return result, nil
+	return &result, nil
 }
 
 // GetMarketplace returns the marketplace.
@@ -1312,7 +1481,7 @@ func (c *Client) GetDashboardStats(ctx context.Context) (map[string]any, error) 
 	return result, nil
 }
 
-// DetectDrift compares two eval runs for drift.
+// DetectDrift compares two eval runs for drift. POST /api/v1/monitoring/drift/detect.
 func (c *Client) DetectDrift(ctx context.Context, baselineRunID, currentRunID string) (map[string]any, error) {
 	body := map[string]any{"baselineRunId": baselineRunID, "currentRunId": currentRunID}
 	var result map[string]any
@@ -1341,9 +1510,10 @@ func (c *Client) GetAutopilotConfig(ctx context.Context) (map[string]any, error)
 	return result, nil
 }
 
-// ListPipelines returns all pipelines.
-func (c *Client) ListPipelines(ctx context.Context) ([]map[string]any, error) {
-	var result []map[string]any
+// ListPipelines returns pipeline templates and the caller's custom pipelines.
+// The server replies with an object {templates, custom}, not a bare array.
+func (c *Client) ListPipelines(ctx context.Context) (map[string]any, error) {
+	var result map[string]any
 	if err := c.doRequest(ctx, http.MethodGet, "/pipelines", nil, &result); err != nil {
 		return nil, fmt.Errorf("ListPipelines: %w", err)
 	}
@@ -1662,6 +1832,7 @@ func (c *Client) FetchTraceAttachment(ctx context.Context, traceID, attachmentID
 	reqHTTP.Header.Set("Authorization", "Bearer "+c.apiKey)
 	reqHTTP.Header.Set("Accept", "application/octet-stream")
 	reqHTTP.Header.Set("User-Agent", userAgent)
+	reqHTTP.Header.Set("x-evalguard-client-version", clientVersion)
 
 	resp, err := c.httpClient.Do(reqHTTP)
 	if err != nil {
@@ -1879,6 +2050,911 @@ func (c *Client) AnalyzeTrace(ctx context.Context, opts AnalyzeTraceOpts) (map[s
 	return result, nil
 }
 
+// ─── Agent tools (the agent-builder tool registry) ────────────────────────
+//
+// CRUD + a dry-run test harness for the tools an agent workflow can call.
+// A tool is one of three kinds — a REST call, a sandboxed code snippet, or an
+// MCP server invocation — described by a JSON-Schema parameter object so the
+// builder UI can render an input form. Routes live under /api/v1/agent-tools;
+// every call is project-scoped (projectId, a UUID, is required server-side).
+
+// AgentToolParameters is the JSON-Schema object describing a tool's inputs.
+// Type is always "object"; Properties maps each argument name to its schema
+// fragment; Required lists the mandatory argument names.
+type AgentToolParameters struct {
+	Type       string         `json:"type"`
+	Properties map[string]any `json:"properties"`
+	Required   []string       `json:"required,omitempty"`
+}
+
+// AgentToolREST configures a "rest" tool — an outbound HTTP request the agent
+// makes when the tool is invoked. BodyTemplate may interpolate the tool's
+// arguments; Auth, when set, injects a credential header server-side (the
+// plaintext value is never echoed back — see AgentTool.HasSecret).
+type AgentToolREST struct {
+	Method       string            `json:"method"`
+	URL          string            `json:"url"`
+	Headers      map[string]string `json:"headers,omitempty"`
+	Auth         *AgentToolAuth    `json:"auth,omitempty"`
+	BodyTemplate string            `json:"bodyTemplate,omitempty"`
+	TimeoutMs    int               `json:"timeoutMs,omitempty"`
+}
+
+// AgentToolAuth describes how a "rest" tool authenticates. Type is e.g.
+// "bearer" or "header"; Header names the header to set when Type is "header";
+// Value is the secret credential (write-only — responses omit it).
+type AgentToolAuth struct {
+	Type   string `json:"type"`
+	Header string `json:"header,omitempty"`
+	Value  string `json:"value,omitempty"`
+}
+
+// AgentToolCode configures a "code" tool — a sandboxed snippet evaluated with
+// the tool arguments in scope. TimeoutMs caps the execution wall clock.
+type AgentToolCode struct {
+	Source    string `json:"source"`
+	TimeoutMs int    `json:"timeoutMs,omitempty"`
+}
+
+// AgentToolMCP configures an "mcp" tool — a call to a named tool on a Model
+// Context Protocol server. ToolName defaults to the AgentTool name when empty.
+type AgentToolMCP struct {
+	Server   string `json:"server"`
+	ToolName string `json:"toolName,omitempty"`
+}
+
+// AgentTool is a single tool the agent-builder can wire into a workflow. ID is
+// assigned by the server on create and echoed on reads. Type selects which of
+// REST/Code/MCP is populated. HasSecret is a server-set read-only flag that is
+// true when a credential is stored for the tool (the plaintext is never
+// returned). Mirrors the AgentTool shape on /api/v1/agent-tools.
+type AgentTool struct {
+	ID          string              `json:"id,omitempty"`
+	Name        string              `json:"name"`
+	Description string              `json:"description,omitempty"`
+	Type        string              `json:"type"` // "rest" | "code" | "mcp"
+	Parameters  AgentToolParameters `json:"parameters"`
+	REST        *AgentToolREST      `json:"rest,omitempty"`
+	Code        *AgentToolCode      `json:"code,omitempty"`
+	MCP         *AgentToolMCP       `json:"mcp,omitempty"`
+	HasSecret   bool                `json:"hasSecret,omitempty"`
+}
+
+// listAgentToolsResponse is the GET /agent-tools envelope's data object.
+type listAgentToolsResponse struct {
+	Tools []AgentTool `json:"tools"`
+}
+
+// agentToolBody is the create/update request body: a project scope plus the
+// tool definition. PATCH and POST share this shape.
+type agentToolBody struct {
+	ProjectID string    `json:"projectId"`
+	Tool      AgentTool `json:"tool"`
+}
+
+// AgentToolTestResult is the outcome of POST /agent-tools/{id}/test — a dry
+// run of the tool with caller-supplied arguments. Ok is the headline verdict;
+// Stage names where execution got to (e.g. "validate", "request", "response");
+// Status is the upstream HTTP status for a "rest" tool when one was reached;
+// Body is the captured upstream payload; Issues lists per-argument validation
+// problems; Message is a human-readable summary.
+type AgentToolTestResult struct {
+	Ok      bool     `json:"ok"`
+	Stage   string   `json:"stage"`
+	Status  int      `json:"status,omitempty"`
+	Body    any      `json:"body,omitempty"`
+	Issues  []string `json:"issues,omitempty"`
+	Message string   `json:"message,omitempty"`
+}
+
+// CreateAgentTool registers a new agent tool in a project.
+//
+// POST /api/v1/agent-tools with { projectId, tool } returns 201 with the
+// stored tool (server-assigned ID, HasSecret reflecting any credential).
+func (c *Client) CreateAgentTool(ctx context.Context, projectID string, tool AgentTool) (*AgentTool, error) {
+	if projectID == "" {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "CreateAgentTool: projectID is required"}
+	}
+	var result AgentTool
+	body := agentToolBody{ProjectID: projectID, Tool: tool}
+	if err := c.doRequest(ctx, http.MethodPost, "/agent-tools", body, &result); err != nil {
+		return nil, fmt.Errorf("CreateAgentTool: %w", err)
+	}
+	return &result, nil
+}
+
+// GetAgentTool fetches a single agent tool by ID. The credential plaintext is
+// never returned; HasSecret indicates whether one is stored.
+// GET /api/v1/agent-tools/{id}?projectId=...
+func (c *Client) GetAgentTool(ctx context.Context, toolID, projectID string) (*AgentTool, error) {
+	if projectID == "" {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "GetAgentTool: projectID is required"}
+	}
+	q := url.Values{}
+	q.Set("projectId", projectID)
+	var result AgentTool
+	path := fmt.Sprintf("/agent-tools/%s?%s", url.PathEscape(toolID), q.Encode())
+	if err := c.doRequest(ctx, http.MethodGet, path, nil, &result); err != nil {
+		return nil, fmt.Errorf("GetAgentTool: %w", err)
+	}
+	return &result, nil
+}
+
+// ListAgentTools returns all agent tools for a project.
+// GET /api/v1/agent-tools?projectId=... — projectId is required.
+func (c *Client) ListAgentTools(ctx context.Context, projectID string) ([]AgentTool, error) {
+	if projectID == "" {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "ListAgentTools: projectID is required"}
+	}
+	q := url.Values{}
+	q.Set("projectId", projectID)
+	var result listAgentToolsResponse
+	if err := c.doRequest(ctx, http.MethodGet, "/agent-tools?"+q.Encode(), nil, &result); err != nil {
+		return nil, fmt.Errorf("ListAgentTools: %w", err)
+	}
+	return result.Tools, nil
+}
+
+// UpdateAgentTool patches an existing agent tool. PATCH /api/v1/agent-tools/{id}
+// with { projectId, tool } returns the stored tool after the merge.
+func (c *Client) UpdateAgentTool(ctx context.Context, toolID, projectID string, tool AgentTool) (*AgentTool, error) {
+	if projectID == "" {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "UpdateAgentTool: projectID is required"}
+	}
+	var result AgentTool
+	body := agentToolBody{ProjectID: projectID, Tool: tool}
+	path := fmt.Sprintf("/agent-tools/%s", url.PathEscape(toolID))
+	if err := c.doRequest(ctx, http.MethodPatch, path, body, &result); err != nil {
+		return nil, fmt.Errorf("UpdateAgentTool: %w", err)
+	}
+	return &result, nil
+}
+
+// DeleteAgentTool removes an agent tool. DELETE /api/v1/agent-tools/{id}?projectId=...
+// Returns the deleted id; an error otherwise.
+func (c *Client) DeleteAgentTool(ctx context.Context, toolID, projectID string) error {
+	if projectID == "" {
+		return &EvalGuardError{Code: ErrCodeValidation, Message: "DeleteAgentTool: projectID is required"}
+	}
+	q := url.Values{}
+	q.Set("projectId", projectID)
+	path := fmt.Sprintf("/agent-tools/%s?%s", url.PathEscape(toolID), q.Encode())
+	if err := c.doRequest(ctx, http.MethodDelete, path, nil, nil); err != nil {
+		return fmt.Errorf("DeleteAgentTool: %w", err)
+	}
+	return nil
+}
+
+// TestAgentTool dry-runs a tool with the given arguments and returns the
+// execution outcome. POST /api/v1/agent-tools/{id}/test with { projectId, args }.
+func (c *Client) TestAgentTool(ctx context.Context, toolID, projectID string, args map[string]any) (*AgentToolTestResult, error) {
+	if projectID == "" {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "TestAgentTool: projectID is required"}
+	}
+	body := map[string]any{"projectId": projectID, "args": args}
+	var result AgentToolTestResult
+	path := fmt.Sprintf("/agent-tools/%s/test", url.PathEscape(toolID))
+	if err := c.doRequest(ctx, http.MethodPost, path, body, &result); err != nil {
+		return nil, fmt.Errorf("TestAgentTool: %w", err)
+	}
+	return &result, nil
+}
+
+// ─── Abuse reports (defense-in-depth intake) ──────────────────────────────
+//
+// Trust-and-safety intake: a reporter flags a subject under a category, and
+// the server returns the stored report plus an auto-triage verdict (severity,
+// dedup key, escalation/detector-feed flags). Routes are project-scoped under
+// /api/v1/abuse-reports.
+
+// AbuseReport is a stored trust-and-safety report.
+type AbuseReport struct {
+	ID          string         `json:"id"`
+	ProjectID   string         `json:"projectId,omitempty"`
+	Category    string         `json:"category"`
+	Description string         `json:"description,omitempty"`
+	SubjectID   string         `json:"subjectId,omitempty"`
+	ReporterID  string         `json:"reporterId,omitempty"`
+	Status      string         `json:"status,omitempty"`
+	Evidence    map[string]any `json:"evidence,omitempty"`
+	CreatedAt   string         `json:"createdAt,omitempty"`
+}
+
+// AbuseTriage is the auto-triage verdict returned alongside a created report.
+// Severity is the computed risk tier; DedupKey collapses duplicate reports of
+// the same subject+category; AutoEscalate routes high-risk categories to a
+// human queue; FeedToDetector signals the report should train the firewall;
+// Reasons explains the verdict.
+type AbuseTriage struct {
+	Severity       string   `json:"severity"`
+	Category       string   `json:"category"`
+	DedupKey       string   `json:"dedupKey"`
+	AutoEscalate   bool     `json:"autoEscalate"`
+	FeedToDetector bool     `json:"feedToDetector"`
+	Reasons        []string `json:"reasons,omitempty"`
+}
+
+// ReportAbuseRequest is the POST /abuse-reports body. Category is required and
+// must be one of: csam, violence, self_harm, harassment, hate, fraud, privacy,
+// spam, other. The rest are optional context.
+type ReportAbuseRequest struct {
+	ProjectID   string         `json:"projectId"`
+	Category    string         `json:"category"`
+	Description string         `json:"description,omitempty"`
+	SubjectID   string         `json:"subjectId,omitempty"`
+	ReporterID  string         `json:"reporterId,omitempty"`
+	Evidence    map[string]any `json:"evidence,omitempty"`
+}
+
+// ReportAbuseResponse is the 201 payload: the stored report plus its triage.
+type ReportAbuseResponse struct {
+	Report AbuseReport `json:"report"`
+	Triage AbuseTriage `json:"triage"`
+}
+
+// listAbuseReportsResponse is the GET /abuse-reports envelope's data object.
+type listAbuseReportsResponse struct {
+	Reports []AbuseReport `json:"reports"`
+}
+
+// ReportAbuse files a trust-and-safety report and returns the stored row plus
+// its auto-triage verdict. POST /api/v1/abuse-reports returns 201.
+func (c *Client) ReportAbuse(ctx context.Context, req *ReportAbuseRequest) (*ReportAbuseResponse, error) {
+	if req == nil {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "ReportAbuse: req is required"}
+	}
+	if req.ProjectID == "" {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "ReportAbuse: ProjectID is required"}
+	}
+	if req.Category == "" {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "ReportAbuse: Category is required"}
+	}
+	var result ReportAbuseResponse
+	if err := c.doRequest(ctx, http.MethodPost, "/abuse-reports", req, &result); err != nil {
+		return nil, fmt.Errorf("ReportAbuse: %w", err)
+	}
+	return &result, nil
+}
+
+// ListAbuseReports returns abuse reports for a project, optionally filtered by
+// status. GET /api/v1/abuse-reports?projectId=...&status=... — projectId is
+// required; pass status="" for all statuses (otherwise one of open, reviewing,
+// actioned, dismissed).
+func (c *Client) ListAbuseReports(ctx context.Context, projectID, status string) ([]AbuseReport, error) {
+	if projectID == "" {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "ListAbuseReports: projectID is required"}
+	}
+	q := url.Values{}
+	q.Set("projectId", projectID)
+	if status != "" {
+		q.Set("status", status)
+	}
+	var result listAbuseReportsResponse
+	if err := c.doRequest(ctx, http.MethodGet, "/abuse-reports?"+q.Encode(), nil, &result); err != nil {
+		return nil, fmt.Errorf("ListAbuseReports: %w", err)
+	}
+	return result.Reports, nil
+}
+
+// ─── Agent deployments (publish a workflow as a chat widget) ───────────────
+//
+// Publishes a built agent workflow to a channel (an embeddable web widget,
+// Slack, WhatsApp, or a raw API endpoint) and manages the deployment lifecycle.
+// Create/list hang off /api/v1/workflows/{workflowId}/deploy; update/delete
+// address the deployment directly at /api/v1/deployments/{id}.
+
+// AgentDeployment is a published workflow endpoint. PublicID is the
+// caller-shareable handle used to embed/address the widget; the remaining
+// fields mirror the deployment row.
+type AgentDeployment struct {
+	ID             string   `json:"id"`
+	PublicID       string   `json:"public_id"`
+	WorkflowID     string   `json:"workflow_id,omitempty"`
+	ProjectID      string   `json:"project_id,omitempty"`
+	Channel        string   `json:"channel"`
+	Status         string   `json:"status,omitempty"`
+	Greeting       string   `json:"greeting,omitempty"`
+	AllowedOrigins []string `json:"allowed_origins,omitempty"`
+	CreatedAt      string   `json:"created_at,omitempty"`
+	UpdatedAt      string   `json:"updated_at,omitempty"`
+}
+
+// listAgentDeploymentsResponse is the GET deploy envelope's data object.
+type listAgentDeploymentsResponse struct {
+	Deployments []AgentDeployment `json:"deployments"`
+}
+
+// DeployAgentRequest is the POST /workflows/{workflowId}/deploy body. Channel
+// is required (one of web, slack, whatsapp, api). AllowedOrigins scopes the
+// embeddable web widget's CORS; Greeting is the widget's opening message.
+type DeployAgentRequest struct {
+	ProjectID      string   `json:"projectId"`
+	Channel        string   `json:"channel"`
+	AllowedOrigins []string `json:"allowedOrigins,omitempty"`
+	Greeting       string   `json:"greeting,omitempty"`
+}
+
+// UpdateAgentDeploymentRequest is the PATCH /deployments/{id} body. All fields
+// beyond ProjectID are optional; nil/empty fields are left unchanged. Status
+// toggles the deployment between "active" and "paused".
+type UpdateAgentDeploymentRequest struct {
+	ProjectID      string    `json:"projectId"`
+	Status         string    `json:"status,omitempty"`
+	Greeting       *string   `json:"greeting,omitempty"`
+	AllowedOrigins *[]string `json:"allowedOrigins,omitempty"`
+}
+
+// DeployAgent publishes a workflow to a channel and returns the new deployment
+// (including its public_id). POST /api/v1/workflows/{workflowId}/deploy → 201.
+func (c *Client) DeployAgent(ctx context.Context, workflowID string, req *DeployAgentRequest) (*AgentDeployment, error) {
+	if req == nil {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "DeployAgent: req is required"}
+	}
+	if req.ProjectID == "" {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "DeployAgent: ProjectID is required"}
+	}
+	if req.Channel == "" {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "DeployAgent: Channel is required"}
+	}
+	var result AgentDeployment
+	path := fmt.Sprintf("/workflows/%s/deploy", url.PathEscape(workflowID))
+	if err := c.doRequest(ctx, http.MethodPost, path, req, &result); err != nil {
+		return nil, fmt.Errorf("DeployAgent: %w", err)
+	}
+	return &result, nil
+}
+
+// ListAgentDeployments returns the deployments for a workflow.
+// GET /api/v1/workflows/{workflowId}/deploy?projectId=... — projectId required.
+func (c *Client) ListAgentDeployments(ctx context.Context, workflowID, projectID string) ([]AgentDeployment, error) {
+	if projectID == "" {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "ListAgentDeployments: projectID is required"}
+	}
+	q := url.Values{}
+	q.Set("projectId", projectID)
+	var result listAgentDeploymentsResponse
+	path := fmt.Sprintf("/workflows/%s/deploy?%s", url.PathEscape(workflowID), q.Encode())
+	if err := c.doRequest(ctx, http.MethodGet, path, nil, &result); err != nil {
+		return nil, fmt.Errorf("ListAgentDeployments: %w", err)
+	}
+	return result.Deployments, nil
+}
+
+// UpdateAgentDeployment patches a deployment (pause/resume, greeting, origins).
+// PATCH /api/v1/deployments/{id} returns the updated deployment.
+func (c *Client) UpdateAgentDeployment(ctx context.Context, deploymentID string, req *UpdateAgentDeploymentRequest) (*AgentDeployment, error) {
+	if req == nil {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "UpdateAgentDeployment: req is required"}
+	}
+	if req.ProjectID == "" {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "UpdateAgentDeployment: ProjectID is required"}
+	}
+	var result AgentDeployment
+	path := fmt.Sprintf("/deployments/%s", url.PathEscape(deploymentID))
+	if err := c.doRequest(ctx, http.MethodPatch, path, req, &result); err != nil {
+		return nil, fmt.Errorf("UpdateAgentDeployment: %w", err)
+	}
+	return &result, nil
+}
+
+// DeleteAgentDeployment unpublishes a deployment.
+// DELETE /api/v1/deployments/{id}?projectId=... — projectId required.
+func (c *Client) DeleteAgentDeployment(ctx context.Context, deploymentID, projectID string) error {
+	if projectID == "" {
+		return &EvalGuardError{Code: ErrCodeValidation, Message: "DeleteAgentDeployment: projectID is required"}
+	}
+	q := url.Values{}
+	q.Set("projectId", projectID)
+	path := fmt.Sprintf("/deployments/%s?%s", url.PathEscape(deploymentID), q.Encode())
+	if err := c.doRequest(ctx, http.MethodDelete, path, nil, nil); err != nil {
+		return fmt.Errorf("DeleteAgentDeployment: %w", err)
+	}
+	return nil
+}
+
+// --- Agent memory (two-tier: long-term semantic recall) ---
+
+// MemoryHit is one long-term semantic-recall result. Score is nil when listing
+// recent facts without a query.
+type MemoryHit struct {
+	ID        string   `json:"id,omitempty"`
+	Content   string   `json:"content"`
+	Score     *float64 `json:"score"`
+	CreatedAt string   `json:"createdAt,omitempty"`
+}
+
+// MemoryTurn is a conversation turn fed to LLM fact extraction.
+type MemoryTurn struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+// RememberMemoryResult reports which facts were stored vs. skipped as duplicates.
+type RememberMemoryResult struct {
+	Written []string `json:"written"`
+	Skipped []string `json:"skipped"`
+}
+
+// RecallMemoryResult is the recall response's data object.
+type RecallMemoryResult struct {
+	Semantic []MemoryHit `json:"semantic"`
+}
+
+type rememberMemoryBody struct {
+	ProjectID  string       `json:"projectId"`
+	SessionKey string       `json:"sessionKey"`
+	Facts      []string     `json:"facts,omitempty"`
+	Turns      []MemoryTurn `json:"turns,omitempty"`
+	AgentID    string       `json:"agentId,omitempty"`
+}
+
+// RememberMemory stores durable facts (or a conversation to extract facts from)
+// for a session. POST /api/v1/agent-memory.
+func (c *Client) RememberMemory(ctx context.Context, projectID, sessionKey string, facts []string, turns []MemoryTurn, agentID string) (*RememberMemoryResult, error) {
+	if projectID == "" {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "RememberMemory: projectID is required"}
+	}
+	if sessionKey == "" {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "RememberMemory: sessionKey is required"}
+	}
+	if len(facts) == 0 && len(turns) == 0 {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "RememberMemory: provide facts or turns"}
+	}
+	var result RememberMemoryResult
+	body := rememberMemoryBody{ProjectID: projectID, SessionKey: sessionKey, Facts: facts, Turns: turns, AgentID: agentID}
+	if err := c.doRequest(ctx, http.MethodPost, "/agent-memory", body, &result); err != nil {
+		return nil, fmt.Errorf("RememberMemory: %w", err)
+	}
+	return &result, nil
+}
+
+// RecallMemory recalls a session's long-term memory by semantic similarity to
+// query (empty query lists recent facts). GET /api/v1/agent-memory.
+func (c *Client) RecallMemory(ctx context.Context, projectID, sessionKey, query string, limit int) (*RecallMemoryResult, error) {
+	if projectID == "" {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "RecallMemory: projectID is required"}
+	}
+	if sessionKey == "" {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "RecallMemory: sessionKey is required"}
+	}
+	q := url.Values{}
+	q.Set("projectId", projectID)
+	q.Set("sessionKey", sessionKey)
+	if query != "" {
+		q.Set("query", query)
+	}
+	if limit > 0 {
+		q.Set("limit", fmt.Sprintf("%d", limit))
+	}
+	var result RecallMemoryResult
+	if err := c.doRequest(ctx, http.MethodGet, "/agent-memory?"+q.Encode(), nil, &result); err != nil {
+		return nil, fmt.Errorf("RecallMemory: %w", err)
+	}
+	return &result, nil
+}
+
+// ForgetMemory forgets a session's long-term memory, returning the number of
+// rows removed. DELETE /api/v1/agent-memory.
+func (c *Client) ForgetMemory(ctx context.Context, projectID, sessionKey string) (int, error) {
+	if projectID == "" {
+		return 0, &EvalGuardError{Code: ErrCodeValidation, Message: "ForgetMemory: projectID is required"}
+	}
+	if sessionKey == "" {
+		return 0, &EvalGuardError{Code: ErrCodeValidation, Message: "ForgetMemory: sessionKey is required"}
+	}
+	q := url.Values{}
+	q.Set("projectId", projectID)
+	q.Set("sessionKey", sessionKey)
+	var result struct {
+		Forgotten int `json:"forgotten"`
+	}
+	if err := c.doRequest(ctx, http.MethodDelete, "/agent-memory?"+q.Encode(), nil, &result); err != nil {
+		return 0, fmt.Errorf("ForgetMemory: %w", err)
+	}
+	return result.Forgotten, nil
+}
+
+// --- Voice ML (word-level ASR + deepfake detection via sidecar) ---
+
+// VoiceWord is a single word with its time span (ms relative to audio start).
+type VoiceWord struct {
+	Word       string   `json:"word"`
+	StartMs    int      `json:"startMs"`
+	EndMs      int      `json:"endMs"`
+	Confidence *float64 `json:"confidence,omitempty"`
+}
+
+// VoiceSegment is a coarse transcript span.
+type VoiceSegment struct {
+	StartMs int    `json:"startMs"`
+	EndMs   int    `json:"endMs"`
+	Text    string `json:"text"`
+}
+
+// TranscriptResult is the word-level ASR result.
+type TranscriptResult struct {
+	Language   string         `json:"language,omitempty"`
+	DurationMs int            `json:"durationMs,omitempty"`
+	Text       string         `json:"text"`
+	Words      []VoiceWord    `json:"words"`
+	Segments   []VoiceSegment `json:"segments,omitempty"`
+}
+
+// DeepfakeScore is the synthetic-speech detection result; Probability is P(synthetic) in [0,1].
+type DeepfakeScore struct {
+	Probability float64 `json:"probability"`
+	Model       string  `json:"model,omitempty"`
+}
+
+type voiceBody struct {
+	ProjectID   string `json:"projectId"`
+	AudioBase64 string `json:"audioBase64"`
+	Language    string `json:"language,omitempty"`
+}
+
+// TranscribeVoice transcribes base64-encoded WAV audio with WORD-LEVEL
+// timestamps. POST /api/v1/voice/transcribe. Requires the operator-deployed
+// voice-ML sidecar (returns an error wrapping HTTP 503 otherwise).
+func (c *Client) TranscribeVoice(ctx context.Context, projectID, audioBase64, language string) (*TranscriptResult, error) {
+	if projectID == "" {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "TranscribeVoice: projectID is required"}
+	}
+	if audioBase64 == "" {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "TranscribeVoice: audioBase64 is required"}
+	}
+	var result TranscriptResult
+	body := voiceBody{ProjectID: projectID, AudioBase64: audioBase64, Language: language}
+	if err := c.doRequest(ctx, http.MethodPost, "/voice/transcribe", body, &result); err != nil {
+		return nil, fmt.Errorf("TranscribeVoice: %w", err)
+	}
+	return &result, nil
+}
+
+// ScoreVoiceDeepfake scores base64-encoded WAV audio for synthetic-speech /
+// deepfake probability in [0,1]. POST /api/v1/voice/deepfake-score.
+func (c *Client) ScoreVoiceDeepfake(ctx context.Context, projectID, audioBase64 string) (*DeepfakeScore, error) {
+	if projectID == "" {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "ScoreVoiceDeepfake: projectID is required"}
+	}
+	if audioBase64 == "" {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "ScoreVoiceDeepfake: audioBase64 is required"}
+	}
+	var result DeepfakeScore
+	body := voiceBody{ProjectID: projectID, AudioBase64: audioBase64}
+	if err := c.doRequest(ctx, http.MethodPost, "/voice/deepfake-score", body, &result); err != nil {
+		return nil, fmt.Errorf("ScoreVoiceDeepfake: %w", err)
+	}
+	return &result, nil
+}
+
+// --- Language detection (text → language) ---
+
+// LanguageDetection is the result of text language identification (franc-min).
+type LanguageDetection struct {
+	ISO6393    string  `json:"iso6393"`
+	ISO6391    *string `json:"iso6391"`
+	Name       *string `json:"name"`
+	Confidence float64 `json:"confidence"`
+	Reliable   bool    `json:"reliable"`
+}
+
+type detectLanguageBody struct {
+	ProjectID string `json:"projectId"`
+	Text      string `json:"text"`
+	MinLength int    `json:"minLength,omitempty"`
+}
+
+// DetectLanguage identifies the language of a text snippet. POST /api/v1/language/detect.
+func (c *Client) DetectLanguage(ctx context.Context, projectID, text string) (*LanguageDetection, error) {
+	if projectID == "" {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "DetectLanguage: projectID is required"}
+	}
+	if text == "" {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "DetectLanguage: text is required"}
+	}
+	var result LanguageDetection
+	body := detectLanguageBody{ProjectID: projectID, Text: text}
+	if err := c.doRequest(ctx, http.MethodPost, "/language/detect", body, &result); err != nil {
+		return nil, fmt.Errorf("DetectLanguage: %w", err)
+	}
+	return &result, nil
+}
+
+// --- RAG (retrieval-augmented generation) ---
+
+// RAGDocument is a single document/chunk to ingest into the RAG pipeline.
+type RAGDocument struct {
+	ID       string         `json:"id,omitempty"`
+	Text     string         `json:"text"`
+	Metadata map[string]any `json:"metadata,omitempty"`
+}
+
+// RAGChunking controls how documents are split before embedding.
+type RAGChunking struct {
+	Strategy     string `json:"strategy,omitempty"` // "fixed" | "recursive"
+	ChunkSize    int    `json:"chunkSize,omitempty"`
+	ChunkOverlap int    `json:"chunkOverlap,omitempty"`
+}
+
+// IngestRAGRequest is the payload for IngestRAGDocuments.
+type IngestRAGRequest struct {
+	ProjectID  string        `json:"projectId"`
+	Documents  []RAGDocument `json:"documents"`
+	Chunking   *RAGChunking  `json:"chunking,omitempty"`
+	Embed      bool          `json:"embed,omitempty"`
+	EmbedModel string        `json:"embedModel,omitempty"`
+}
+
+// IngestRAGDocuments chunks (and optionally embeds) documents through the RAG
+// ingest pipeline, which also runs DLP + prompt-injection screening on every
+// chunk. POST /api/v1/rag/ingest. Returns the chunks plus dlp/injection reports.
+// Embedding uses the tenant's BYOK OpenAI key (projectId-scoped).
+func (c *Client) IngestRAGDocuments(ctx context.Context, req *IngestRAGRequest) (map[string]any, error) {
+	if req == nil || req.ProjectID == "" {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "IngestRAGDocuments: projectID is required"}
+	}
+	if len(req.Documents) == 0 {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "IngestRAGDocuments: at least one document is required"}
+	}
+	var result map[string]any
+	if err := c.doRequest(ctx, http.MethodPost, "/rag/ingest", req, &result); err != nil {
+		return nil, fmt.Errorf("IngestRAGDocuments: %w", err)
+	}
+	return result, nil
+}
+
+// RAGInjectionDocument is one document/chunk to vet for embedded prompt injection.
+type RAGInjectionDocument struct {
+	Text   string `json:"text"`
+	Source string `json:"source,omitempty"`
+}
+
+// RAGInjectionScanResult is the outcome of ScanRAGInjection.
+type RAGInjectionScanResult struct {
+	Scanned         int              `json:"scanned"`
+	Clean           bool             `json:"clean"`
+	PoisonedCount   int              `json:"poisonedCount"`
+	PoisonedIndices []int            `json:"poisonedIndices"`
+	Violations      []map[string]any `json:"violations"`
+}
+
+type scanRAGInjectionBody struct {
+	ProjectID   string                 `json:"projectId,omitempty"`
+	Documents   []RAGInjectionDocument `json:"documents"`
+	MinSeverity string                 `json:"minSeverity,omitempty"`
+}
+
+// ScanRAGInjection screens retrieved documents/chunks for embedded prompt
+// injection ("poisoned" context) before they reach the model. minSeverity
+// defaults to "high" server-side. POST /api/v1/security/rag-injection-scan.
+func (c *Client) ScanRAGInjection(ctx context.Context, projectID string, documents []RAGInjectionDocument, minSeverity string) (*RAGInjectionScanResult, error) {
+	if projectID == "" {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "ScanRAGInjection: projectID is required"}
+	}
+	if len(documents) == 0 {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "ScanRAGInjection: at least one document is required"}
+	}
+	var result RAGInjectionScanResult
+	body := scanRAGInjectionBody{ProjectID: projectID, Documents: documents, MinSeverity: minSeverity}
+	if err := c.doRequest(ctx, http.MethodPost, "/security/rag-injection-scan", body, &result); err != nil {
+		return nil, fmt.Errorf("ScanRAGInjection: %w", err)
+	}
+	return &result, nil
+}
+
+// --- Multimodal moderation (image / video / deepfake) ---
+
+// ModerationFrame is a single video frame for frame-by-frame moderation.
+type ModerationFrame struct {
+	ImageURL    string  `json:"imageUrl,omitempty"`
+	ImageBase64 string  `json:"imageBase64,omitempty"`
+	MimeType    string  `json:"mimeType,omitempty"`
+	TimestampMs float64 `json:"timestampMs,omitempty"`
+}
+
+// ModerateImageRequest is the payload for ModerateImage. Provide either ImageURL
+// (fetched server-side; SSRF-guarded) or ImageBase64 (inline).
+type ModerateImageRequest struct {
+	OrgID       string  `json:"orgId"`
+	ProjectID   string  `json:"projectId"`
+	ImageURL    string  `json:"imageUrl,omitempty"`
+	ImageBase64 string  `json:"imageBase64,omitempty"`
+	MimeType    string  `json:"mimeType,omitempty"`
+	Threshold   float64 `json:"threshold,omitempty"`
+	Provider    string  `json:"provider,omitempty"` // "openai"
+}
+
+// ModerateImage runs BYO vision-model content moderation on a single image.
+// Requires a provider (OpenAI) key configured for the project. Fails closed.
+// POST /api/v1/moderation/image.
+func (c *Client) ModerateImage(ctx context.Context, req *ModerateImageRequest) (map[string]any, error) {
+	if req == nil || req.OrgID == "" || req.ProjectID == "" {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "ModerateImage: orgID and projectID are required"}
+	}
+	if req.ImageURL == "" && req.ImageBase64 == "" {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "ModerateImage: imageURL or imageBase64 is required"}
+	}
+	var result map[string]any
+	if err := c.doRequest(ctx, http.MethodPost, "/moderation/image", req, &result); err != nil {
+		return nil, fmt.Errorf("ModerateImage: %w", err)
+	}
+	return result, nil
+}
+
+// ModerateVideoRequest is the payload for ModerateVideo.
+type ModerateVideoRequest struct {
+	OrgID        string            `json:"orgId"`
+	ProjectID    string            `json:"projectId"`
+	Frames       []ModerationFrame `json:"frames"`
+	Threshold    float64           `json:"threshold,omitempty"`
+	MaxFrames    int               `json:"maxFrames,omitempty"`
+	SampleEveryN int               `json:"sampleEveryN,omitempty"`
+	Provider     string            `json:"provider,omitempty"`
+}
+
+// ModerateVideo runs BYO vision-model moderation across sampled video frames and
+// aggregates the per-frame verdicts. POST /api/v1/moderation/video.
+func (c *Client) ModerateVideo(ctx context.Context, req *ModerateVideoRequest) (map[string]any, error) {
+	if req == nil || req.OrgID == "" || req.ProjectID == "" {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "ModerateVideo: orgID and projectID are required"}
+	}
+	if len(req.Frames) == 0 {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "ModerateVideo: at least one frame is required"}
+	}
+	var result map[string]any
+	if err := c.doRequest(ctx, http.MethodPost, "/moderation/video", req, &result); err != nil {
+		return nil, fmt.Errorf("ModerateVideo: %w", err)
+	}
+	return result, nil
+}
+
+// DetectMediaDeepfakeRequest is the payload for DetectMediaDeepfake. For a single
+// image set ImageURL/ImageBase64; for a clip set Frames (Kind defaults from the
+// shape of the input).
+type DetectMediaDeepfakeRequest struct {
+	OrgID        string            `json:"orgId"`
+	ProjectID    string            `json:"projectId"`
+	Kind         string            `json:"kind,omitempty"` // "image" | "video"
+	ImageURL     string            `json:"imageUrl,omitempty"`
+	ImageBase64  string            `json:"imageBase64,omitempty"`
+	MimeType     string            `json:"mimeType,omitempty"`
+	Frames       []ModerationFrame `json:"frames,omitempty"`
+	Threshold    float64           `json:"threshold,omitempty"`
+	MaxFrames    int               `json:"maxFrames,omitempty"`
+	SampleEveryN int               `json:"sampleEveryN,omitempty"`
+}
+
+// DetectMediaDeepfake scores an image or video clip for AI-generated / deepfake
+// likelihood via the operator-deployed deepfake backend. POST /api/v1/moderation/deepfake.
+func (c *Client) DetectMediaDeepfake(ctx context.Context, req *DetectMediaDeepfakeRequest) (map[string]any, error) {
+	if req == nil || req.OrgID == "" || req.ProjectID == "" {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "DetectMediaDeepfake: orgID and projectID are required"}
+	}
+	if req.ImageURL == "" && req.ImageBase64 == "" && len(req.Frames) == 0 {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "DetectMediaDeepfake: provide imageURL/imageBase64 or frames"}
+	}
+	var result map[string]any
+	if err := c.doRequest(ctx, http.MethodPost, "/moderation/deepfake", req, &result); err != nil {
+		return nil, fmt.Errorf("DetectMediaDeepfake: %w", err)
+	}
+	return result, nil
+}
+
+// --- MCP / agent security ---
+
+// McpAuditFinding is one finding from a pre-deploy MCP server audit.
+type McpAuditFinding struct {
+	Severity    string `json:"severity"`
+	Category    string `json:"category"`
+	Target      string `json:"target"`
+	Title       string `json:"title"`
+	Detail      string `json:"detail"`
+	Remediation string `json:"remediation"`
+}
+
+// McpAuditReport is the severity-tiered result of a pre-deploy MCP server audit.
+type McpAuditReport struct {
+	Verdict   string            `json:"verdict"`
+	RiskScore int               `json:"riskScore"`
+	ToolCount int               `json:"toolCount"`
+	Summary   map[string]int    `json:"summary"`
+	Findings  []McpAuditFinding `json:"findings"`
+}
+
+type mcpAuditBody struct {
+	ProjectID string           `json:"projectId"`
+	Server    map[string]any   `json:"server"`
+	Tools     []map[string]any `json:"tools"`
+}
+
+// AuditMcpServer runs a pre-deploy security audit of an MCP server config.
+// POST /api/v1/security/mcp-predeployment-audit.
+func (c *Client) AuditMcpServer(ctx context.Context, projectID string, server map[string]any, tools []map[string]any) (*McpAuditReport, error) {
+	if projectID == "" {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "AuditMcpServer: projectID is required"}
+	}
+	if server == nil {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "AuditMcpServer: server is required"}
+	}
+	if tools == nil {
+		tools = []map[string]any{}
+	}
+	var result McpAuditReport
+	body := mcpAuditBody{ProjectID: projectID, Server: server, Tools: tools}
+	if err := c.doRequest(ctx, http.MethodPost, "/security/mcp-predeployment-audit", body, &result); err != nil {
+		return nil, fmt.Errorf("AuditMcpServer: %w", err)
+	}
+	return &result, nil
+}
+
+// AgentExecRedTeamResult is the breach verdict from an execution-layer red-team.
+type AgentExecRedTeamResult struct {
+	TotalAttacks      int      `json:"totalAttacks"`
+	DangerousAttempts int      `json:"dangerousAttempts"`
+	Breaches          int      `json:"breaches"`
+	Verdict           string   `json:"verdict"`
+	Tools             []string `json:"tools"`
+}
+
+type agentExecBody struct {
+	ProjectID      string   `json:"projectId"`
+	TargetProvider string   `json:"target_provider"`
+	TargetModel    string   `json:"target_model"`
+	AttackPrompts  []string `json:"attack_prompts,omitempty"`
+}
+
+// RunAgentExecRedTeam runs an execution-layer red-team against a target agent.
+// POST /api/v1/security/agent-exec-redteam (uses the org's BYOK provider key).
+func (c *Client) RunAgentExecRedTeam(ctx context.Context, projectID, provider, model string, attackPrompts []string) (*AgentExecRedTeamResult, error) {
+	if projectID == "" {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "RunAgentExecRedTeam: projectID is required"}
+	}
+	if provider == "" || model == "" {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "RunAgentExecRedTeam: provider and model are required"}
+	}
+	var result AgentExecRedTeamResult
+	body := agentExecBody{ProjectID: projectID, TargetProvider: provider, TargetModel: model, AttackPrompts: attackPrompts}
+	if err := c.doRequest(ctx, http.MethodPost, "/security/agent-exec-redteam", body, &result); err != nil {
+		return nil, fmt.Errorf("RunAgentExecRedTeam: %w", err)
+	}
+	return &result, nil
+}
+
+// AgentCommEdge is one aggregated who-calls-whom edge.
+type AgentCommEdge struct {
+	From         string `json:"from"`
+	To           string `json:"to"`
+	CallCount    int    `json:"callCount"`
+	ErrorCount   int    `json:"errorCount"`
+	AvgLatencyMs int    `json:"avgLatencyMs"`
+}
+
+// AgentCommGraph is the agent-to-agent communication graph.
+type AgentCommGraph struct {
+	Services    []string        `json:"services"`
+	Edges       []AgentCommEdge `json:"edges"`
+	TotalCalls  int             `json:"totalCalls"`
+	TotalErrors int             `json:"totalErrors"`
+}
+
+// GetAgentGraph fetches the agent-to-agent communication graph over a window.
+// GET /api/v1/traces/graph.
+func (c *Client) GetAgentGraph(ctx context.Context, projectID string, windowHours int) (*AgentCommGraph, error) {
+	if projectID == "" {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "GetAgentGraph: projectID is required"}
+	}
+	q := url.Values{}
+	q.Set("projectId", projectID)
+	if windowHours > 0 {
+		q.Set("windowHours", fmt.Sprintf("%d", windowHours))
+	}
+	var result AgentCommGraph
+	if err := c.doRequest(ctx, http.MethodGet, "/traces/graph?"+q.Encode(), nil, &result); err != nil {
+		return nil, fmt.Errorf("GetAgentGraph: %w", err)
+	}
+	return &result, nil
+}
+
 // --- Internal HTTP plumbing ---
 
 // newIdempotencyKey returns a random RFC-4122 v4 UUID string. Used as the
@@ -1960,6 +3036,7 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body any, t
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Accept", "application/json")
 		req.Header.Set("User-Agent", userAgent)
+		req.Header.Set("x-evalguard-client-version", clientVersion)
 		if idempotencyKey != "" {
 			// Same key on every attempt → server dedups the retry.
 			req.Header.Set("Idempotency-Key", idempotencyKey)
