@@ -33,6 +33,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -49,7 +50,7 @@ const (
 	// clientVersion is sent as x-evalguard-client-version on every request so an
 	// org that pins allowed client versions can enforce its policy on this SDK
 	// (deep-audit 2026-06-21). Keep in lockstep with userAgent above.
-	clientVersion = "1.2.0"
+	clientVersion = "1.4.0"
 )
 
 // ErrorCode represents categorized API error codes.
@@ -95,7 +96,10 @@ type RateLimitError struct {
 // Option configures the Client.
 type Option func(*Client)
 
-// WithBaseURL sets a custom API base URL.
+// WithBaseURL sets a custom API base URL. The value is validated when the
+// client is built (see NewClient): a plaintext http:// base for a non-loopback
+// host is rejected because every request sends "Authorization: Bearer <apiKey>"
+// and a cleartext URL would leak the key. Trailing slashes are stripped.
 func WithBaseURL(url string) Option {
 	return func(c *Client) { c.baseURL = url }
 }
@@ -124,6 +128,32 @@ type Client struct {
 	resolvedProjectID string
 }
 
+// secureBaseURL validates and normalizes an API base URL. It mirrors
+// assertSecureBaseUrl in wrapper-core (guardrail-client.ts) and the Python
+// client (client.py): a plaintext http:// base for a NON-loopback host is
+// refused because every request carries "Authorization: Bearer <apiKey>", so a
+// cleartext URL would leak the key and let a MITM tamper with responses.
+// http://localhost / 127.0.0.1 / ::1 stay allowed for local development;
+// https:// and wss:// always pass. Trailing slashes are stripped so that
+// baseURL+path never produces a double slash.
+func secureBaseURL(base string) (string, error) {
+	trimmed := strings.TrimRight(base, "/")
+	u, err := url.Parse(trimmed)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return "", &EvalGuardError{Code: ErrCodeValidation, Message: fmt.Sprintf("baseURL is not a valid URL: %q", base)}
+	}
+	// url.Hostname strips the brackets from an IPv6 literal (e.g. "[::1]" -> "::1").
+	host := u.Hostname()
+	isLoopback := host == "localhost" || host == "127.0.0.1" || host == "::1"
+	if u.Scheme == "http" && !isLoopback {
+		return "", &EvalGuardError{
+			Code:    ErrCodeValidation,
+			Message: fmt.Sprintf("baseURL must use https:// (got %q) — a plaintext URL would leak your API key; use https, or http://localhost for local testing", base),
+		}
+	}
+	return trimmed, nil
+}
+
 // NewClient creates a new EvalGuard client.
 func NewClient(apiKey string, opts ...Option) (*Client, error) {
 	if apiKey == "" {
@@ -139,6 +169,14 @@ func NewClient(apiKey string, opts ...Option) (*Client, error) {
 	for _, o := range opts {
 		o(c)
 	}
+	// Reject an insecure (plaintext, non-loopback) base URL now that any
+	// WithBaseURL override has been applied — WithBaseURL can't return an error
+	// itself, so the option's contract is enforced here at build time.
+	normalized, err := secureBaseURL(c.baseURL)
+	if err != nil {
+		return nil, err
+	}
+	c.baseURL = normalized
 	return c, nil
 }
 
@@ -623,7 +661,7 @@ func (c *Client) DiffDatasetVersions(ctx context.Context, datasetID, fromVersion
 
 // ── Evaluator Hub (versioned, reusable evaluator registry) ──────────
 //
-// Arize-parity registry: one row per (project, name, version), content-hash
+// Content-hash registry: one row per (project, name, version), content-hash
 // deduped. Mirrors the TS/Python SDKs + the `evalguard evaluators` CLI.
 
 // ListEvaluators returns evaluator versions for a project (newest first).
@@ -895,6 +933,212 @@ func (c *Client) ListPrompts(ctx context.Context, projectID string) ([]map[strin
 	q.Set("projectId", projectID)
 	if err := c.doRequest(ctx, http.MethodGet, "/prompts?"+q.Encode(), nil, &result); err != nil {
 		return nil, fmt.Errorf("ListPrompts: %w", err)
+	}
+	return result, nil
+}
+
+// --- Environments (Phase 2) ---
+//
+// Arbitrary NAMED deployment environments replace the old hardcoded
+// staging/production pair (both seeded server-side for back-compat).
+
+// ListEnvironments lists every named environment in the workspace.
+func (c *Client) ListEnvironments(ctx context.Context, projectID string) ([]map[string]any, error) {
+	var result []map[string]any
+	q := url.Values{}
+	q.Set("projectId", projectID)
+	if err := c.doRequest(ctx, http.MethodGet, "/environments?"+q.Encode(), nil, &result); err != nil {
+		return nil, fmt.Errorf("ListEnvironments: %w", err)
+	}
+	return result, nil
+}
+
+// CreateEnvironment creates a named environment. tag defaults to "other" when
+// empty; at most one environment may carry "default" (the fallback).
+func (c *Client) CreateEnvironment(ctx context.Context, projectID, name, tag string) (map[string]any, error) {
+	if strings.TrimSpace(name) == "" {
+		return nil, fmt.Errorf("CreateEnvironment: environment name is required")
+	}
+	if tag == "" {
+		tag = "other"
+	}
+	body := map[string]any{"projectId": projectID, "name": name, "tag": tag}
+	var result map[string]any
+	if err := c.doRequest(ctx, http.MethodPost, "/environments", body, &result); err != nil {
+		return nil, fmt.Errorf("CreateEnvironment: %w", err)
+	}
+	return result, nil
+}
+
+// RemoveEnvironment removes a named environment.
+func (c *Client) RemoveEnvironment(ctx context.Context, projectID, name string) (map[string]any, error) {
+	q := url.Values{}
+	q.Set("projectId", projectID)
+	var result map[string]any
+	if err := c.doRequest(ctx, http.MethodDelete, "/environments/"+url.PathEscape(name)+"?"+q.Encode(), nil, &result); err != nil {
+		return nil, fmt.Errorf("RemoveEnvironment: %w", err)
+	}
+	return result, nil
+}
+
+// SetPromptDeployment sets the deployed prompt version for the specified
+// environment — the (project, environment, version) deployment mapping for the
+// prompt.
+func (c *Client) SetPromptDeployment(ctx context.Context, projectID, name, environment string, version int) (map[string]any, error) {
+	body := map[string]any{"projectId": projectID, "environment": environment, "version": version}
+	var result map[string]any
+	if err := c.doRequest(ctx, http.MethodPost, "/prompts/"+url.PathEscape(name)+"/deployments", body, &result); err != nil {
+		return nil, fmt.Errorf("SetPromptDeployment: %w", err)
+	}
+	return result, nil
+}
+
+// RemovePromptDeployment removes the deployed prompt version from an environment.
+func (c *Client) RemovePromptDeployment(ctx context.Context, projectID, name, environment string) (map[string]any, error) {
+	q := url.Values{}
+	q.Set("projectId", projectID)
+	q.Set("environment", environment)
+	var result map[string]any
+	if err := c.doRequest(ctx, http.MethodDelete, "/prompts/"+url.PathEscape(name)+"/deployments?"+q.Encode(), nil, &result); err != nil {
+		return nil, fmt.Errorf("RemovePromptDeployment: %w", err)
+	}
+	return result, nil
+}
+
+// ListPromptEnvironments lists all environments and the prompt version deployed
+// to each.
+func (c *Client) ListPromptEnvironments(ctx context.Context, projectID, name string) ([]map[string]any, error) {
+	q := url.Values{}
+	q.Set("projectId", projectID)
+	var result []map[string]any
+	if err := c.doRequest(ctx, http.MethodGet, "/prompts/"+url.PathEscape(name)+"/environments?"+q.Encode(), nil, &result); err != nil {
+		return nil, fmt.Errorf("ListPromptEnvironments: %w", err)
+	}
+	return result, nil
+}
+
+// --- Tools (Phase 2) ---
+//
+// Managed, versioned Tools deployed to named environments. The config is
+// validated client-side.
+
+// CreateTool creates (or upserts a new version of) a managed Tool. config is
+// validated client-side; a malformed config returns an error before any
+// network call.
+func (c *Client) CreateTool(ctx context.Context, projectID, name string, config ToolConfig) (map[string]any, error) {
+	if ok, errs := ValidateToolConfig(config); !ok {
+		return nil, fmt.Errorf("CreateTool: invalid tool config: %s", strings.Join(errs, "; "))
+	}
+	body := map[string]any{"projectId": projectID, "name": name, "config": config}
+	var result map[string]any
+	if err := c.doRequest(ctx, http.MethodPost, "/tools", body, &result); err != nil {
+		return nil, fmt.Errorf("CreateTool: %w", err)
+	}
+	return result, nil
+}
+
+// GetTool gets a Tool (latest version, or a specific version when version > 0).
+func (c *Client) GetTool(ctx context.Context, projectID, name string, version int) (map[string]any, error) {
+	q := url.Values{}
+	q.Set("projectId", projectID)
+	if version > 0 {
+		q.Set("version", fmt.Sprintf("%d", version))
+	}
+	var result map[string]any
+	if err := c.doRequest(ctx, http.MethodGet, "/tools/"+url.PathEscape(name)+"?"+q.Encode(), nil, &result); err != nil {
+		return nil, fmt.Errorf("GetTool: %w", err)
+	}
+	return result, nil
+}
+
+// ListTools lists all managed Tools in the workspace.
+func (c *Client) ListTools(ctx context.Context, projectID string) ([]map[string]any, error) {
+	q := url.Values{}
+	q.Set("projectId", projectID)
+	var result []map[string]any
+	if err := c.doRequest(ctx, http.MethodGet, "/tools?"+q.Encode(), nil, &result); err != nil {
+		return nil, fmt.Errorf("ListTools: %w", err)
+	}
+	return result, nil
+}
+
+// ListToolVersions lists every version of a Tool, ascending by version number.
+func (c *Client) ListToolVersions(ctx context.Context, projectID, name string) ([]map[string]any, error) {
+	q := url.Values{}
+	q.Set("projectId", projectID)
+	var result []map[string]any
+	if err := c.doRequest(ctx, http.MethodGet, "/tools/"+url.PathEscape(name)+"/versions?"+q.Encode(), nil, &result); err != nil {
+		return nil, fmt.Errorf("ListToolVersions: %w", err)
+	}
+	return result, nil
+}
+
+// SetToolDeployment sets the deployed Tool version for the specified
+// environment — the (project, environment, version) deployment mapping for the
+// Tool.
+func (c *Client) SetToolDeployment(ctx context.Context, projectID, name, environment string, version int) (map[string]any, error) {
+	body := map[string]any{"projectId": projectID, "environment": environment, "version": version}
+	var result map[string]any
+	if err := c.doRequest(ctx, http.MethodPost, "/tools/"+url.PathEscape(name)+"/deployments", body, &result); err != nil {
+		return nil, fmt.Errorf("SetToolDeployment: %w", err)
+	}
+	return result, nil
+}
+
+// RemoveToolDeployment removes the deployed Tool version from an environment.
+func (c *Client) RemoveToolDeployment(ctx context.Context, projectID, name, environment string) (map[string]any, error) {
+	q := url.Values{}
+	q.Set("projectId", projectID)
+	q.Set("environment", environment)
+	var result map[string]any
+	if err := c.doRequest(ctx, http.MethodDelete, "/tools/"+url.PathEscape(name)+"/deployments?"+q.Encode(), nil, &result); err != nil {
+		return nil, fmt.Errorf("RemoveToolDeployment: %w", err)
+	}
+	return result, nil
+}
+
+// ListToolEnvironments lists all environments and the Tool version deployed to each.
+func (c *Client) ListToolEnvironments(ctx context.Context, projectID, name string) ([]map[string]any, error) {
+	q := url.Values{}
+	q.Set("projectId", projectID)
+	var result []map[string]any
+	if err := c.doRequest(ctx, http.MethodGet, "/tools/"+url.PathEscape(name)+"/environments?"+q.Encode(), nil, &result); err != nil {
+		return nil, fmt.Errorf("ListToolEnvironments: %w", err)
+	}
+	return result, nil
+}
+
+// GetToolEnvironmentVariables lists a Tool's environment variables.
+func (c *Client) GetToolEnvironmentVariables(ctx context.Context, projectID, name string) ([]ToolEnvironmentVariable, error) {
+	q := url.Values{}
+	q.Set("projectId", projectID)
+	var result []ToolEnvironmentVariable
+	if err := c.doRequest(ctx, http.MethodGet, "/tools/"+url.PathEscape(name)+"/environment-variables?"+q.Encode(), nil, &result); err != nil {
+		return nil, fmt.Errorf("GetToolEnvironmentVariables: %w", err)
+	}
+	return result, nil
+}
+
+// AddToolEnvironmentVariable adds (or overwrites) an environment variable on a Tool.
+func (c *Client) AddToolEnvironmentVariable(ctx context.Context, projectID, name, varName, value string) ([]ToolEnvironmentVariable, error) {
+	if strings.TrimSpace(varName) == "" {
+		return nil, fmt.Errorf("AddToolEnvironmentVariable: environment variable name is required")
+	}
+	body := map[string]any{"projectId": projectID, "variable": ToolEnvironmentVariable{Name: varName, Value: value}}
+	var result []ToolEnvironmentVariable
+	if err := c.doRequest(ctx, http.MethodPost, "/tools/"+url.PathEscape(name)+"/environment-variables", body, &result); err != nil {
+		return nil, fmt.Errorf("AddToolEnvironmentVariable: %w", err)
+	}
+	return result, nil
+}
+
+// DeleteToolEnvironmentVariable deletes an environment variable from a Tool by name.
+func (c *Client) DeleteToolEnvironmentVariable(ctx context.Context, projectID, name, varName string) ([]ToolEnvironmentVariable, error) {
+	q := url.Values{}
+	q.Set("projectId", projectID)
+	var result []ToolEnvironmentVariable
+	if err := c.doRequest(ctx, http.MethodDelete, "/tools/"+url.PathEscape(name)+"/environment-variables/"+url.PathEscape(varName)+"?"+q.Encode(), nil, &result); err != nil {
+		return nil, fmt.Errorf("DeleteToolEnvironmentVariable: %w", err)
 	}
 	return result, nil
 }

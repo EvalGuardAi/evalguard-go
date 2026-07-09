@@ -60,6 +60,45 @@ func TestWithOptions(t *testing.T) {
 	}
 }
 
+func TestWithBaseURLHTTPSGuard(t *testing.T) {
+	// A plaintext http:// base for a non-loopback host must be REJECTED: every
+	// request sends "Authorization: Bearer <apiKey>", so a cleartext URL leaks
+	// the key. Mirrors assertSecureBaseUrl in wrapper-core / the Python client.
+	rejected := []string{
+		"http://evalguard.internal",
+		"http://evalguard.internal/api/v1",
+		"http://api.example.com/v1",
+	}
+	for _, base := range rejected {
+		if _, err := NewClient("eg_test", WithBaseURL(base)); err == nil {
+			t.Fatalf("expected insecure baseURL %q to be rejected", base)
+		}
+	}
+
+	// https:// and http://<loopback> are accepted for real + local-dev use.
+	accepted := []struct {
+		in   string
+		want string
+	}{
+		{"https://evalguard.ai/api/v1", "https://evalguard.ai/api/v1"},
+		{"https://evalguard.internal", "https://evalguard.internal"},
+		{"http://localhost:3000/api/v1", "http://localhost:3000/api/v1"},
+		{"http://127.0.0.1:3000/api/v1", "http://127.0.0.1:3000/api/v1"},
+		{"http://[::1]:3000/api/v1", "http://[::1]:3000/api/v1"},
+		// Trailing slashes are stripped so baseURL+path can't double up.
+		{"https://evalguard.ai/api/v1/", "https://evalguard.ai/api/v1"},
+	}
+	for _, tc := range accepted {
+		c, err := NewClient("eg_test", WithBaseURL(tc.in))
+		if err != nil {
+			t.Fatalf("expected baseURL %q to be accepted, got error: %v", tc.in, err)
+		}
+		if c.baseURL != tc.want {
+			t.Fatalf("baseURL %q: expected normalized %q, got %q", tc.in, tc.want, c.baseURL)
+		}
+	}
+}
+
 func TestErrorTypes(t *testing.T) {
 	// EvalGuardError
 	err := &EvalGuardError{Code: ErrCodeUnauthorized, Message: "bad key", StatusCode: 401, RequestID: "req-123"}
