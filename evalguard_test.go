@@ -81,12 +81,22 @@ func TestWithBaseURLHTTPSGuard(t *testing.T) {
 		want string
 	}{
 		{"https://evalguard.ai/api/v1", "https://evalguard.ai/api/v1"},
+		// A bare host (no "/api" segment) is left untouched — it's what the
+		// httptest mocks use, and normalization only rewrites a ".../api" base.
 		{"https://evalguard.internal", "https://evalguard.internal"},
 		{"http://localhost:3000/api/v1", "http://localhost:3000/api/v1"},
 		{"http://127.0.0.1:3000/api/v1", "http://127.0.0.1:3000/api/v1"},
 		{"http://[::1]:3000/api/v1", "http://[::1]:3000/api/v1"},
 		// Trailing slashes are stripped so baseURL+path can't double up.
 		{"https://evalguard.ai/api/v1/", "https://evalguard.ai/api/v1"},
+		// JS-B6 parity: a ".../api" base (missing the version segment) gets
+		// "/v1" appended so every version-less request path resolves correctly
+		// instead of 404ing.
+		{"https://evalguard.ai/api", "https://evalguard.ai/api/v1"},
+		{"https://evalguard.ai/api/", "https://evalguard.ai/api/v1"},
+		{"http://localhost:3000/api", "http://localhost:3000/api/v1"},
+		// A self-host mounted under a sub-path still normalizes.
+		{"https://self-host.example.com/eg/api", "https://self-host.example.com/eg/api/v1"},
 	}
 	for _, tc := range accepted {
 		c, err := NewClient("eg_test", WithBaseURL(tc.in))
@@ -1839,5 +1849,140 @@ func TestHandleErrorResponse_SurfacesServerCodeAndCategory(t *testing.T) {
 				t.Errorf("status: want %d, got %d", tc.status, egErr.StatusCode)
 			}
 		})
+	}
+}
+
+// ─── E2E audit regression (2026-07-16): GenerateAISBOM contract ──────────────
+//
+// The live-prod Go SDK audit found GenerateAISBOM 100% broken: it POSTed
+// {"projectId": <uuid>} to /ai-sbom/generate, but the route validates on
+// projectName and 400'd every call with "projectName: Invalid input". These
+// tests pin the corrected {projectName, ...opts} body so it can't regress.
+
+func TestGenerateAISBOM_SendsProjectNameAndOptions(t *testing.T) {
+	rec := &recordingServer{}
+	c, cleanup := newRecordingServer(t, http.StatusOK, map[string]any{
+		"format":             "EvalGuard-AIBOM",
+		"bom":                map[string]any{"components": []any{}},
+		"detectedComponents": map[string]any{},
+	}, rec)
+	defer cleanup()
+
+	liveOff := false
+	res, err := c.GenerateAISBOM(context.Background(), "my-service", &GenerateAISBOMOptions{
+		ProjectVersion: "2.1.0",
+		Format:         "cyclonedx",
+		GoMod:          "module example.com/x\n\ngo 1.21\n",
+		GoSum:          "example.com/y v1.0.0 h1:abc=\n",
+		ProviderKeys:   []string{"openai", "anthropic"},
+		Agents:         []AISBOMAgent{{Name: "router", Model: "gpt-4o", Source: "discovery"}},
+		LiveCveScan:    &liveOff,
+	})
+	if err != nil {
+		t.Fatalf("GenerateAISBOM: %v", err)
+	}
+	if rec.method != http.MethodPost || rec.path != "/ai-sbom/generate" {
+		t.Fatalf("want POST /ai-sbom/generate, got %s %s", rec.method, rec.path)
+	}
+	// projectName is REQUIRED by the route; projectId must NOT be sent (the old,
+	// rejected shape).
+	if rec.body["projectName"] != "my-service" {
+		t.Errorf("projectName: want my-service, got %v", rec.body["projectName"])
+	}
+	if _, ok := rec.body["projectId"]; ok {
+		t.Errorf("legacy 'projectId' key must NOT be sent: %v", rec.body)
+	}
+	if rec.body["projectVersion"] != "2.1.0" || rec.body["format"] != "cyclonedx" {
+		t.Errorf("projectVersion/format not sent: %v", rec.body)
+	}
+	if rec.body["goMod"] == nil || rec.body["goSum"] == nil {
+		t.Errorf("goMod/goSum not sent: %v", rec.body)
+	}
+	// liveCveScan is a *bool: false must be sent (not omitted), since the server
+	// default is on and the caller explicitly asked for an offline scan.
+	if v, ok := rec.body["liveCveScan"].(bool); !ok || v != false {
+		t.Errorf("liveCveScan: want explicit false, got %v (ok=%v)", rec.body["liveCveScan"], ok)
+	}
+	keys, _ := rec.body["providerKeys"].([]any)
+	if len(keys) != 2 || keys[0] != "openai" {
+		t.Errorf("providerKeys not sent: %v", rec.body["providerKeys"])
+	}
+	agents, _ := rec.body["agents"].([]any)
+	if len(agents) != 1 {
+		t.Fatalf("agents not sent: %v", rec.body["agents"])
+	}
+	agent0, _ := agents[0].(map[string]any)
+	if agent0["name"] != "router" || agent0["source"] != "discovery" {
+		t.Errorf("agent shape wrong: %v", agents[0])
+	}
+	// Unset optional fields must be omitted (omitempty), not sent as zero values.
+	for _, k := range []string{"packageJson", "pythonRequirements", "pomXml", "evalguardConfig"} {
+		if _, ok := rec.body[k]; ok {
+			t.Errorf("optional field %q should be omitted when unset: %v", k, rec.body)
+		}
+	}
+	if res["format"] != "EvalGuard-AIBOM" {
+		t.Errorf("response not decoded: %v", res)
+	}
+}
+
+func TestGenerateAISBOM_NilOptionsSendsBareProjectName(t *testing.T) {
+	rec := &recordingServer{}
+	c, cleanup := newRecordingServer(t, http.StatusOK, map[string]any{"format": "EvalGuard-AIBOM"}, rec)
+	defer cleanup()
+
+	if _, err := c.GenerateAISBOM(context.Background(), "svc", nil); err != nil {
+		t.Fatalf("GenerateAISBOM with nil opts: %v", err)
+	}
+	if rec.body["projectName"] != "svc" {
+		t.Errorf("projectName not sent: %v", rec.body)
+	}
+	// With nil opts only projectName should be present on the wire.
+	if len(rec.body) != 1 {
+		t.Errorf("expected only projectName, got %v", rec.body)
+	}
+}
+
+func TestGenerateAISBOM_ValidatesProjectName(t *testing.T) {
+	c, _ := NewClient("eg_test", WithBaseURL("http://nowhere"))
+	for _, name := range []string{"", "   "} {
+		if _, err := c.GenerateAISBOM(context.Background(), name, nil); err == nil {
+			t.Fatalf("expected validation error for projectName %q", name)
+		}
+	}
+}
+
+// TestCreateAnnotation_ValidatesLabel pins the client-side label enum check:
+// POST /annotations validates label ∈ {good,bad,unsure} and 400s otherwise, so
+// the SDK rejects a bad label before the wire and passes a valid one through.
+func TestCreateAnnotation_ValidatesLabel(t *testing.T) {
+	// Invalid label → validation error, no HTTP call.
+	cBad, _ := NewClient("eg_test", WithBaseURL("http://nowhere"))
+	_, err := cBad.CreateAnnotation(context.Background(), "proj-1", "log-1", "excellent")
+	if err == nil {
+		t.Fatal("expected validation error for invalid label")
+	}
+	var egErr *EvalGuardError
+	if !asEvalGuardError(err, &egErr) || egErr.Code != ErrCodeValidation {
+		t.Fatalf("want ErrCodeValidation, got %T: %v", err, err)
+	}
+
+	// Each valid label is accepted and forwarded verbatim.
+	for _, label := range AnnotationLabels {
+		rec := &recordingServer{}
+		c, cleanup := newRecordingServer(t, http.StatusCreated, map[string]any{"id": "ann-1", "label": label}, rec)
+		if _, err := c.CreateAnnotation(context.Background(), "proj-1", "log-1", label); err != nil {
+			cleanup()
+			t.Fatalf("CreateAnnotation(%q): %v", label, err)
+		}
+		if rec.method != http.MethodPost || rec.path != "/annotations" {
+			cleanup()
+			t.Fatalf("want POST /annotations, got %s %s", rec.method, rec.path)
+		}
+		if rec.body["label"] != label || rec.body["logId"] != "log-1" {
+			cleanup()
+			t.Errorf("body wrong for label %q: %v", label, rec.body)
+		}
+		cleanup()
 	}
 }

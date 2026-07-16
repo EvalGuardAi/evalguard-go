@@ -46,11 +46,11 @@ const (
 const (
 	DefaultBaseURL = "https://evalguard.ai/api/v1"
 	DefaultTimeout = 30 * time.Second
-	userAgent      = "evalguard-go/1.4.1"
+	userAgent      = "evalguard-go/1.4.2"
 	// clientVersion is sent as x-evalguard-client-version on every request so an
 	// org that pins allowed client versions can enforce its policy on this SDK
 	// (deep-audit 2026-06-21). Keep in lockstep with userAgent above.
-	clientVersion = "1.4.1"
+	clientVersion = "1.4.2"
 )
 
 // ErrorCode represents categorized API error codes.
@@ -96,10 +96,14 @@ type RateLimitError struct {
 // Option configures the Client.
 type Option func(*Client)
 
-// WithBaseURL sets a custom API base URL. The value is validated when the
-// client is built (see NewClient): a plaintext http:// base for a non-loopback
-// host is rejected because every request sends "Authorization: Bearer <apiKey>"
-// and a cleartext URL would leak the key. Trailing slashes are stripped.
+// WithBaseURL sets a custom API base URL. The value is validated and normalized
+// when the client is built (see NewClient): a plaintext http:// base for a
+// non-loopback host is rejected because every request sends
+// "Authorization: Bearer <apiKey>" and a cleartext URL would leak the key.
+// Trailing slashes are stripped, and the "/v1" version segment is appended when
+// missing — so "https://evalguard.ai/api" normalizes to
+// "https://evalguard.ai/api/v1" instead of 404ing every call (every request
+// path here is version-less, e.g. "/evals"). Mirrors the TS/CLI/Python SDKs.
 func WithBaseURL(url string) Option {
 	return func(c *Client) { c.baseURL = url }
 }
@@ -136,6 +140,16 @@ type Client struct {
 // http://localhost / 127.0.0.1 / ::1 stay allowed for local development;
 // https:// and wss:// always pass. Trailing slashes are stripped so that
 // baseURL+path never produces a double slash.
+//
+// Version normalization (JS-B6 parity): every request path in this client is
+// version-less (e.g. "/evals", "/ai-sbom/generate"), so the base must terminate
+// at the "/v1" version segment. When the configured base ends in "/api" — one
+// segment short of the versioned root — "/v1" is appended, so a base of
+// "https://evalguard.ai/api" resolves to "https://evalguard.ai/api/v1" instead
+// of 404ing every call. A base that already ends in "/v1" (the default) is left
+// as-is, and any other path is left untouched (an explicit "/api/v2", a bare
+// host used by local mocks, etc.) so normalization never rewrites a URL the
+// caller deliberately pointed at.
 func secureBaseURL(base string) (string, error) {
 	trimmed := strings.TrimRight(base, "/")
 	u, err := url.Parse(trimmed)
@@ -150,6 +164,12 @@ func secureBaseURL(base string) (string, error) {
 			Code:    ErrCodeValidation,
 			Message: fmt.Sprintf("baseURL must use https:// (got %q) — a plaintext URL would leak your API key; use https, or http://localhost for local testing", base),
 		}
+	}
+	// Compare on the URL path (not the whole string) so a host that merely ends
+	// in the characters "api"/"v1" is never mistaken for a path segment.
+	path := u.EscapedPath()
+	if !strings.HasSuffix(path, "/v1") && strings.HasSuffix(path, "/api") {
+		trimmed += "/v1"
 	}
 	return trimmed, nil
 }
@@ -807,13 +827,25 @@ func (c *Client) GetAIPosture(ctx context.Context, projectID string) (*AIPosture
 // --- Smart Copilot ---
 
 // CopilotAnalyzeRequest contains parameters for copilot analysis.
+//
+// The server (POST /api/v1/copilot/analyze) requires specific shapes per Type
+// and 400s on anything else:
+//   - Type MUST be one of "security", "eval", or "contextual".
+//   - "security"/"contextual" require Findings; each finding needs
+//     {type, severity, title, description, passed(bool)} (pluginId optional).
+//   - "eval" requires Cases; each case needs a string "input", a numeric
+//     "score", and a boolean "passed" (scorerType optional). A case missing the
+//     numeric score is rejected — these maps are free-form on the Go side, so
+//     populate score/passed explicitly.
 type CopilotAnalyzeRequest struct {
-	Type     string           `json:"type"` // "security" or "eval"
+	Type     string           `json:"type"` // "security" | "eval" | "contextual"
 	Model    string           `json:"model"`
 	PassRate float64          `json:"passRate,omitempty"`
 	Score    float64          `json:"score,omitempty"`
 	Findings []map[string]any `json:"findings,omitempty"`
-	Cases    []map[string]any `json:"cases,omitempty"`
+	// Cases entries each require a string "input", a numeric "score", and a
+	// boolean "passed" (e.g. {"input": "2+2?", "score": 1, "passed": true}).
+	Cases []map[string]any `json:"cases,omitempty"`
 }
 
 // CopilotAnalyzeResult is the copilot analysis output.
@@ -1851,8 +1883,31 @@ func (c *Client) ListDatasets(ctx context.Context, projectID string) ([]map[stri
 
 // --- Annotations ---
 
+// AnnotationLabels are the valid values for CreateAnnotation's label argument.
+// POST /api/v1/annotations validates label against this exact enum and 400s on
+// anything else. The server derives a default score from the label when none is
+// given: good → 1.0, bad → 0.0, unsure → 0.5.
+var AnnotationLabels = []string{"good", "bad", "unsure"}
+
 // CreateAnnotation creates an annotation on a log entry.
+//
+// label MUST be one of AnnotationLabels ("good", "bad", or "unsure") — the
+// server rejects any other value with 400. It is checked client-side here so
+// callers get an actionable error before the wire instead of an opaque 400.
 func (c *Client) CreateAnnotation(ctx context.Context, projectID, logID, label string) (map[string]any, error) {
+	valid := false
+	for _, l := range AnnotationLabels {
+		if label == l {
+			valid = true
+			break
+		}
+	}
+	if !valid {
+		return nil, &EvalGuardError{
+			Code:    ErrCodeValidation,
+			Message: fmt.Sprintf("CreateAnnotation: label must be one of %v, got %q", AnnotationLabels, label),
+		}
+	}
 	body := map[string]any{"projectId": projectID, "logId": logID, "label": label}
 	var result map[string]any
 	if err := c.doRequest(ctx, http.MethodPost, "/annotations", body, &result); err != nil {
@@ -2042,9 +2097,83 @@ func (c *Client) GenerateGuardrails(ctx context.Context, description, projectID 
 	return result, nil
 }
 
-// GenerateAISBOM generates an AI Software Bill of Materials.
-func (c *Client) GenerateAISBOM(ctx context.Context, projectID string) (map[string]any, error) {
-	body := map[string]any{"projectId": projectID}
+// AISBOMAgent describes an AI agent to fold into a generated AI-SBOM. The
+// server's scanProject does not auto-detect agents, so pass any that were
+// discovered (e.g. from agent-connector discovery) here. Name and Source are
+// required by POST /ai-sbom/generate; the rest are optional.
+type AISBOMAgent struct {
+	Name       string   `json:"name"`
+	Model      string   `json:"model,omitempty"`
+	Provider   string   `json:"provider,omitempty"`
+	Tools      []string `json:"tools,omitempty"`
+	Guardrails []string `json:"guardrails,omitempty"`
+	Source     string   `json:"source"`
+}
+
+// GenerateAISBOMOptions carries the optional manifest and scan inputs for
+// GenerateAISBOM. Every field is optional — the more manifests / lockfiles you
+// supply, the deeper the supply-chain (CVE + typosquat) coverage over the
+// resolved dependency graph. Mirrors the optional half of the
+// POST /ai-sbom/generate body (see the route's PostBody) and the TS/Python SDKs;
+// projectName, the sole required field, is GenerateAISBOM's first argument.
+type GenerateAISBOMOptions struct {
+	// ProjectVersion labels the generated BOM (defaults to "1.0.0" server-side).
+	ProjectVersion string `json:"projectVersion,omitempty"`
+	// Format selects the export: "json" (default), "cyclonedx", or "spdx".
+	Format string `json:"format,omitempty"`
+	// PackageJSON / PackageLockJSON are parsed npm manifests (arbitrary JSON).
+	PackageJSON     map[string]any `json:"packageJson,omitempty"`
+	PackageLockJSON map[string]any `json:"packageLockJson,omitempty"`
+	// PythonRequirements / PoetryLock are the raw text of the respective files.
+	PythonRequirements string `json:"pythonRequirements,omitempty"`
+	PoetryLock         string `json:"poetryLock,omitempty"`
+	// GoSum / GoMod are the raw text of go.sum / go.mod (transitive coverage).
+	GoSum string `json:"goSum,omitempty"`
+	GoMod string `json:"goMod,omitempty"`
+	// PomXML / BuildGradle / GradleLockfile are the raw text of the JVM manifests.
+	PomXML         string `json:"pomXml,omitempty"`
+	BuildGradle    string `json:"buildGradle,omitempty"`
+	GradleLockfile string `json:"gradleLockfile,omitempty"`
+	// EvalguardConfig / PromptRegistry / DatasetRegistry are arbitrary JSON that
+	// let the generator surface EvalGuard-managed resources in the BOM.
+	EvalguardConfig map[string]any `json:"evalguardConfig,omitempty"`
+	PromptRegistry  map[string]any `json:"promptRegistry,omitempty"`
+	DatasetRegistry map[string]any `json:"datasetRegistry,omitempty"`
+	// ProviderKeys are provider identifiers (not secrets) to fold in.
+	ProviderKeys []string `json:"providerKeys,omitempty"`
+	// Agents are AI agents to include (scanProject does not detect them).
+	Agents []AISBOMAgent `json:"agents,omitempty"`
+	// LiveCveScan toggles live OSV.dev lookups. It is ON by default server-side;
+	// set it to false (via a pointer to false) for an offline-only scan. Left nil
+	// the field is omitted and the server default (on) applies.
+	LiveCveScan *bool `json:"liveCveScan,omitempty"`
+}
+
+// GenerateAISBOM auto-generates an AI Software Bill of Materials from project
+// manifests, with a supply-chain scan: live OSV.dev CVE lookups (default on)
+// over the full resolved dependency graph, an embedded offline CVE database, and
+// typosquat detection.
+//
+// projectName is REQUIRED — POST /ai-sbom/generate validates on projectName, not
+// projectId. The previous {projectId} body was rejected on every call with
+// 400 "projectName: Invalid input"; this now sends {projectName, ...opts}.
+// Unlike GetAISBOM this is NOT project-id scoped: the BOM is built from the
+// manifests you supply, keyed by projectName. Pass lockfiles/manifests via opts
+// for deeper transitive coverage; opts may be nil for a bare scan.
+func (c *Client) GenerateAISBOM(ctx context.Context, projectName string, opts *GenerateAISBOMOptions) (map[string]any, error) {
+	if strings.TrimSpace(projectName) == "" {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "GenerateAISBOM: projectName is required"}
+	}
+	if opts == nil {
+		opts = &GenerateAISBOMOptions{}
+	}
+	// Embed the options so their json tags (with omitempty) are promoted onto the
+	// wire body alongside the always-present projectName.
+	body := struct {
+		ProjectName string `json:"projectName"`
+		*GenerateAISBOMOptions
+	}{ProjectName: projectName, GenerateAISBOMOptions: opts}
+
 	var result map[string]any
 	if err := c.doRequest(ctx, http.MethodPost, "/ai-sbom/generate", body, &result); err != nil {
 		return nil, fmt.Errorf("GenerateAISBOM: %w", err)
