@@ -46,11 +46,11 @@ const (
 const (
 	DefaultBaseURL = "https://evalguard.ai/api/v1"
 	DefaultTimeout = 30 * time.Second
-	userAgent      = "evalguard-go/1.2.0"
+	userAgent      = "evalguard-go/1.4.1"
 	// clientVersion is sent as x-evalguard-client-version on every request so an
 	// org that pins allowed client versions can enforce its policy on this SDK
 	// (deep-audit 2026-06-21). Keep in lockstep with userAgent above.
-	clientVersion = "1.4.0"
+	clientVersion = "1.4.1"
 )
 
 // ErrorCode represents categorized API error codes.
@@ -904,11 +904,71 @@ func (c *Client) GetMonitoringDrift(ctx context.Context, projectID string) (map[
 
 // --- Compliance ---
 
-// CheckCompliance runs a compliance check against frameworks.
-func (c *Client) CheckCompliance(ctx context.Context, orgID string, frameworks []string) (map[string]any, error) {
-	body := map[string]any{"orgId": orgID, "frameworks": frameworks}
+// ComplianceManualEvidence is an operator-supplied assessment of a single
+// framework requirement, forwarded to POST /api/v1/compliance/check so the
+// engine can fold human evidence into the automated result.
+type ComplianceManualEvidence struct {
+	// RequirementID is the framework requirement this evidence answers (required).
+	RequirementID string `json:"requirementId"`
+	// Status is the operator's determination: "met", "partial", or "not-met" (required).
+	Status string `json:"status"`
+	// Evidence is the free-text justification / artifact reference (required).
+	Evidence string `json:"evidence"`
+	// AssessedBy identifies who recorded the evidence (required).
+	AssessedBy string `json:"assessedBy"`
+	// AssessedAt is an optional ISO-8601 timestamp; the server stamps "now" when omitted.
+	AssessedAt string `json:"assessedAt,omitempty"`
+}
+
+// ComplianceCheckRequest is the body for CheckCompliance. It mirrors the live
+// POST /api/v1/compliance/check contract (PostBody in
+// apps/web/src/app/api/v1/compliance/check/route.ts): the check RUNS a real
+// framework assessment against a target model, so it needs the model/provider
+// credentials — not just a list of framework names. The previous
+// {orgId, frameworks} shape 400'd on every call.
+type ComplianceCheckRequest struct {
+	// OrgID is the UUID of the org the assessment belongs to (required). The
+	// route resolves tenancy from this field.
+	OrgID string `json:"orgId"`
+	// Framework is a single framework ID to assess, e.g. "eu-ai-act" (required).
+	// The endpoint validates it against its framework registry.
+	Framework string `json:"framework"`
+	// Model is the target model identifier to assess, e.g. "gpt-4o" (required).
+	Model string `json:"model"`
+	// Provider is the model provider, e.g. "openai" (required).
+	Provider string `json:"provider"`
+	// SystemPrompt is the system prompt the assessment probes against (required).
+	SystemPrompt string `json:"systemPrompt"`
+	// APIKey is the caller-supplied provider credential used to reach the model
+	// during the assessment (required). It is never persisted server-side.
+	APIKey string `json:"apiKey"`
+	// BaseURL optionally overrides the provider endpoint (e.g. a proxy or a
+	// self-hosted gateway).
+	BaseURL string `json:"baseUrl,omitempty"`
+	// ProjectID optionally scopes the assessment to a project (UUID).
+	ProjectID string `json:"projectId,omitempty"`
+	// Categories optionally restricts the assessment to specific requirement categories.
+	Categories []string `json:"categories,omitempty"`
+	// ManualEvidence optionally supplies operator-recorded evidence rows.
+	ManualEvidence []ComplianceManualEvidence `json:"manualEvidence,omitempty"`
+	// PreviousAssessmentID optionally references a prior assessment (UUID) for
+	// gap/delta analysis.
+	PreviousAssessmentID string `json:"previousAssessmentId,omitempty"`
+	// Timeout optionally caps the assessment wall-clock in milliseconds
+	// (server bounds: 1_000..600_000).
+	Timeout int `json:"timeout,omitempty"`
+}
+
+// CheckCompliance runs a compliance assessment for a framework against a target
+// model via POST /api/v1/compliance/check and returns the assessment result
+// (including the persisted assessmentId). OrgID, Framework, Model, Provider,
+// SystemPrompt, and APIKey are required by the endpoint.
+func (c *Client) CheckCompliance(ctx context.Context, req *ComplianceCheckRequest) (map[string]any, error) {
+	if req == nil {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "CheckCompliance: req is required"}
+	}
 	var result map[string]any
-	if err := c.doRequest(ctx, http.MethodPost, "/compliance/check", body, &result); err != nil {
+	if err := c.doRequest(ctx, http.MethodPost, "/compliance/check", req, &result); err != nil {
 		return nil, fmt.Errorf("CheckCompliance: %w", err)
 	}
 	return result, nil
@@ -1210,6 +1270,207 @@ func (c *Client) CheckFirewall(ctx context.Context, req *FirewallCheckRequest) (
 	return &result, nil
 }
 
+// ChatCompletionsRequest is the body for POST /chat/completions (OpenAI-compatible).
+type ChatCompletionsRequest struct {
+	Model               string           `json:"model"`
+	Messages            []map[string]any `json:"messages"`
+	Temperature         *float64         `json:"temperature,omitempty"`
+	TopP                *float64         `json:"top_p,omitempty"`
+	MaxTokens           *int             `json:"max_tokens,omitempty"`
+	MaxCompletionTokens *int             `json:"max_completion_tokens,omitempty"`
+	Stop                any              `json:"stop,omitempty"`
+	// Extra carries any additional OpenAI-compatible params (forwarded verbatim).
+	Extra map[string]any `json:"-"`
+}
+
+// ChatCompletions runs an OpenAI-compatible chat completion (POST /chat/completions),
+// resolving the caller's BYOK provider key server-side and returning the OpenAI-exact
+// response body ({id, object, created, model, choices, usage}). This is the direct
+// single-provider path and works out of the box (unlike a router-config-gated gateway
+// call). Streaming is NOT supported here — point the OpenAI SDK at
+// {baseURL}/chat/completions for SSE streams. Parity with the TS chatCompletions().
+func (c *Client) ChatCompletions(ctx context.Context, req *ChatCompletionsRequest) (map[string]any, error) {
+	if req == nil || req.Model == "" {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "ChatCompletions: req.Model is required"}
+	}
+	if len(req.Messages) == 0 {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "ChatCompletions: at least one message is required"}
+	}
+	body := map[string]any{"model": req.Model, "messages": req.Messages, "stream": false}
+	if req.Temperature != nil {
+		body["temperature"] = *req.Temperature
+	}
+	if req.TopP != nil {
+		body["top_p"] = *req.TopP
+	}
+	if req.MaxTokens != nil {
+		body["max_tokens"] = *req.MaxTokens
+	}
+	if req.MaxCompletionTokens != nil {
+		body["max_completion_tokens"] = *req.MaxCompletionTokens
+	}
+	if req.Stop != nil {
+		body["stop"] = req.Stop
+	}
+	for k, v := range req.Extra {
+		if k != "stream" && v != nil {
+			body[k] = v
+		}
+	}
+	// The route returns the RAW OpenAI body (no {success, data} envelope).
+	var result map[string]any
+	if err := c.doRequest(ctx, http.MethodPost, "/chat/completions", body, &result); err != nil {
+		return nil, fmt.Errorf("ChatCompletions: %w", err)
+	}
+	return result, nil
+}
+
+// RunGuardrails runs text through the org's guardrail policy (POST /guardrails) and
+// returns {action, reasons, latencyMs} where action is allow/redact/block. Optionally
+// scoped to a project's custom rules via projectID. Parity with the TS runGuardrails().
+func (c *Client) RunGuardrails(ctx context.Context, text, projectID string) (map[string]any, error) {
+	if text == "" {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "RunGuardrails: text is required"}
+	}
+	body := map[string]any{"text": text}
+	if projectID != "" {
+		body["projectId"] = projectID
+	}
+	var result map[string]any
+	if err := c.doRequest(ctx, http.MethodPost, "/guardrails", body, &result); err != nil {
+		return nil, fmt.Errorf("RunGuardrails: %w", err)
+	}
+	return result, nil
+}
+
+// SecretScanFile is one file in a multi-file ScanSecrets request.
+type SecretScanFile struct {
+	Path    string `json:"path"`
+	Content string `json:"content"`
+}
+
+// SecretScanRequest is the body for POST /security/secret-scan. Provide Content for a
+// single blob (optionally with Path to locate findings) or Files for a multi-file /
+// PR-diff scan. MinSeverity, when set, drops findings below that level.
+type SecretScanRequest struct {
+	Content     string           `json:"content,omitempty"`
+	Path        string           `json:"path,omitempty"`
+	Files       []SecretScanFile `json:"files,omitempty"`
+	MinSeverity string           `json:"minSeverity,omitempty"`
+}
+
+// ScanSecrets scans content (or a set of files) for leaked secrets — cloud keys,
+// tokens, private-key blocks, high-entropy strings — returning {scannedFiles,
+// filesWithFindings, findingsCount, findings, severityCounts}. Well-known
+// documentation example keys are allowlisted server-side to avoid false positives.
+// Parity with the TS scanSecrets().
+func (c *Client) ScanSecrets(ctx context.Context, req *SecretScanRequest) (map[string]any, error) {
+	if req == nil || (req.Content == "" && len(req.Files) == 0) {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "ScanSecrets: provide Content or a non-empty Files array"}
+	}
+	var result map[string]any
+	if err := c.doRequest(ctx, http.MethodPost, "/security/secret-scan", req, &result); err != nil {
+		return nil, fmt.Errorf("ScanSecrets: %w", err)
+	}
+	return result, nil
+}
+
+// ClassifyIntent classifies a prompt's intent, data-sensitivity, and governance
+// risk (POST /governance/intent/classify) — a stateless, deterministic core
+// classifier (no model round-trip). orgId is REQUIRED by the route (the TS SDK
+// auto-resolves it from the key; the Go thin client takes it explicitly).
+// sensitivityFloor is optional (public/internal/confidential/restricted).
+// Parity with the TS classifyIntent().
+func (c *Client) ClassifyIntent(ctx context.Context, prompt, orgID, sensitivityFloor string) (map[string]any, error) {
+	if prompt == "" {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "ClassifyIntent: prompt is required"}
+	}
+	if orgID == "" {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "ClassifyIntent: orgID is required"}
+	}
+	body := map[string]any{"prompt": prompt, "orgId": orgID}
+	if sensitivityFloor != "" {
+		body["sensitivityFloor"] = sensitivityFloor
+	}
+	var result map[string]any
+	if err := c.doRequest(ctx, http.MethodPost, "/governance/intent/classify", body, &result); err != nil {
+		return nil, fmt.Errorf("ClassifyIntent: %w", err)
+	}
+	return result, nil
+}
+
+// LookupVulnerabilities looks up known CVEs for a set of package URLs (purls)
+// via POST /supply-chain/lookup. Parity with the TS lookupVulnerabilities().
+func (c *Client) LookupVulnerabilities(ctx context.Context, purls []string) (map[string]any, error) {
+	if len(purls) == 0 {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "LookupVulnerabilities: purls must be a non-empty array"}
+	}
+	body := map[string]any{"purls": purls}
+	var result map[string]any
+	if err := c.doRequest(ctx, http.MethodPost, "/supply-chain/lookup", body, &result); err != nil {
+		return nil, fmt.Errorf("LookupVulnerabilities: %w", err)
+	}
+	return result, nil
+}
+
+// IaCFile is one file in a ScanIaC request.
+type IaCFile struct {
+	Filename string `json:"filename"`
+	Content  string `json:"content"`
+}
+
+// ScanIaC scans infrastructure-as-code files (Terraform, CloudFormation, k8s
+// manifests, ...) for misconfigurations (POST /security/iac-scan). Returns
+// {scannedFiles, findingsCount, bySeverity, findings}. Parity with the TS scanIac().
+func (c *Client) ScanIaC(ctx context.Context, files []IaCFile) (map[string]any, error) {
+	if len(files) == 0 {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "ScanIaC: at least one file is required"}
+	}
+	body := map[string]any{"files": files}
+	var result map[string]any
+	if err := c.doRequest(ctx, http.MethodPost, "/security/iac-scan", body, &result); err != nil {
+		return nil, fmt.Errorf("ScanIaC: %w", err)
+	}
+	return result, nil
+}
+
+// CheckFirewallAdvanced runs the firewall with the advanced sensitivity dial and
+// force-block rule categories (POST /firewall/check). sensitivity is optional
+// (e.g. "permissive"/"balanced"/"strict"); rules force-block named attack
+// categories. Parity with the TS checkFirewallAdvanced() (which runs the
+// FirewallEngine in-process in JS; the hosted ensemble is the cross-language
+// equivalent).
+func (c *Client) CheckFirewallAdvanced(ctx context.Context, input string, rules []string, sensitivity string) (*FirewallCheckResponse, error) {
+	if input == "" {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "CheckFirewallAdvanced: input is required"}
+	}
+	body := map[string]any{"input": input}
+	if len(rules) > 0 {
+		body["rules"] = rules
+	}
+	if sensitivity != "" {
+		body["sensitivity"] = sensitivity
+	}
+	var result FirewallCheckResponse
+	if err := c.doRequest(ctx, http.MethodPost, "/firewall/check", body, &result); err != nil {
+		return nil, fmt.Errorf("CheckFirewallAdvanced: %w", err)
+	}
+	return &result, nil
+}
+
+// CheckFirewallOutputAdvanced screens MODEL OUTPUT text through the hosted firewall
+// ensemble (POST /firewall/check) — PII / secret-leak / system-prompt-leak
+// detection all apply to output text. (There is no dedicated hosted output route;
+// the TS SDK runs FirewallEngine.scanOutput in-process, which the thin clients
+// cannot replicate — this is the closest server-side equivalent.) Parity with the
+// TS checkFirewallOutputAdvanced().
+func (c *Client) CheckFirewallOutputAdvanced(ctx context.Context, output string, rules []string, sensitivity string) (*FirewallCheckResponse, error) {
+	if output == "" {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "CheckFirewallOutputAdvanced: output is required"}
+	}
+	return c.CheckFirewallAdvanced(ctx, output, rules, sensitivity)
+}
+
 // ListFirewallRules returns all firewall rules for a project.
 func (c *Client) ListFirewallRules(ctx context.Context, projectID string) ([]map[string]any, error) {
 	var result []map[string]any
@@ -1390,11 +1651,14 @@ func (c *Client) GetSecurityEffectiveness(ctx context.Context, projectID string)
 	return result, nil
 }
 
-// GetSecurityReport returns a security scan report.
-func (c *Client) GetSecurityReport(ctx context.Context, scanID string) (map[string]any, error) {
+// GetSecurityReport returns a previously generated security assessment report.
+// GET /api/v1/security/report?assessmentId=... — the report store is keyed by
+// assessmentId, so the query param MUST be "assessmentId". Sending "scanId"
+// 400s ("assessmentId query param is required") on every call.
+func (c *Client) GetSecurityReport(ctx context.Context, assessmentID string) (map[string]any, error) {
 	var result map[string]any
 	q := url.Values{}
-	q.Set("scanId", scanID)
+	q.Set("assessmentId", assessmentID)
 	if err := c.doRequest(ctx, http.MethodGet, "/security/report?"+q.Encode(), nil, &result); err != nil {
 		return nil, fmt.Errorf("GetSecurityReport: %w", err)
 	}
@@ -1685,9 +1949,13 @@ func (c *Client) ListTemplates(ctx context.Context) (*TemplatesResponse, error) 
 	return &result, nil
 }
 
-// GetMarketplace returns the marketplace.
-func (c *Client) GetMarketplace(ctx context.Context) (map[string]any, error) {
-	var result map[string]any
+// GetMarketplace returns the public marketplace template catalog.
+// GET /api/v1/marketplace replies with a JSON ARRAY of template rows
+// (apiSuccess(enriched) where enriched is an array), so the result must decode
+// into a slice — a map[string]any target fails with "cannot unmarshal array
+// into Go value of type map[string]interface{}".
+func (c *Client) GetMarketplace(ctx context.Context) ([]map[string]any, error) {
+	var result []map[string]any
 	if err := c.doRequest(ctx, http.MethodGet, "/marketplace", nil, &result); err != nil {
 		return nil, fmt.Errorf("GetMarketplace: %w", err)
 	}
@@ -3372,6 +3640,14 @@ func (c *Client) handleErrorResponse(resp *http.Response, body []byte, requestID
 		msg = http.StatusText(statusCode)
 	}
 
+	// The server also nests a structured machine code under "error".code
+	// (VALIDATION_ERROR, INVALID_ID, DB_ERROR, …). Preserve it so callers can
+	// branch on the real reason instead of a flattened HTTP category.
+	serverCode := apiErr.Error.Code
+	if serverCode == "" {
+		serverCode = apiErr.Code
+	}
+
 	base := EvalGuardError{
 		StatusCode: statusCode,
 		Message:    msg,
@@ -3401,7 +3677,20 @@ func (c *Client) handleErrorResponse(resp *http.Response, body []byte, requestID
 		}
 		return &RateLimitError{EvalGuardError: base, RetryAfter: retryAfter}
 	default:
-		base.Code = ErrCodeInternal
+		// Every status the switch doesn't name explicitly used to collapse to
+		// INTERNAL_ERROR, which mislabeled all 400 validation failures as server
+		// faults and discarded the server's structured error.code. Prefer the
+		// real server code when present; otherwise derive a sensible category
+		// from the status class (4xx → validation-style client error, 5xx →
+		// internal) so a 400 never reads as INTERNAL_ERROR.
+		switch {
+		case serverCode != "":
+			base.Code = ErrorCode(serverCode)
+		case statusCode >= 400 && statusCode < 500:
+			base.Code = ErrCodeValidation
+		default:
+			base.Code = ErrCodeInternal
+		}
 		return &base
 	}
 }

@@ -240,7 +240,10 @@ func TestAllMethodSignatures(t *testing.T) {
 		{"GetCostForecast", func() error { _, err := c.GetCostForecast(ctx, "pid"); return err }},
 		{"GetMonitoringAlerts", func() error { _, err := c.GetMonitoringAlerts(ctx, "pid"); return err }},
 		{"GetMonitoringDrift", func() error { _, err := c.GetMonitoringDrift(ctx, "pid"); return err }},
-		{"CheckCompliance", func() error { _, err := c.CheckCompliance(ctx, "oid", nil); return err }},
+		{"CheckCompliance", func() error {
+			_, err := c.CheckCompliance(ctx, &ComplianceCheckRequest{OrgID: "oid", Framework: "eu-ai-act", Model: "gpt-4o", Provider: "openai", SystemPrompt: "sp", APIKey: "k"})
+			return err
+		}},
 		{"CreatePrompt", func() error { _, err := c.CreatePrompt(ctx, "p", "n", "c", "m"); return err }},
 		{"ListPrompts", func() error { _, err := c.ListPrompts(ctx, "pid"); return err }},
 		{"CheckFirewall", func() error { _, err := c.CheckFirewall(ctx, &FirewallCheckRequest{Input: "test"}); return err }},
@@ -1511,6 +1514,20 @@ func TestClientVersionHeaderSent(t *testing.T) {
 	}
 }
 
+// TestUserAgentMatchesClientVersion guards the regression the SDK audit found:
+// userAgent had drifted to "evalguard-go/1.2.0" while clientVersion said "1.4.0".
+// The version embedded in the User-Agent must stay in lockstep with clientVersion.
+func TestUserAgentMatchesClientVersion(t *testing.T) {
+	const prefix = "evalguard-go/"
+	if !strings.HasPrefix(userAgent, prefix) {
+		t.Fatalf("userAgent %q must start with %q", userAgent, prefix)
+	}
+	uaVersion := strings.TrimPrefix(userAgent, prefix)
+	if uaVersion != clientVersion {
+		t.Errorf("userAgent version %q must match clientVersion %q", uaVersion, clientVersion)
+	}
+}
+
 // TestRAGAndModerationMethods exercises the RAG + multimodal-moderation client
 // methods against a mock server, pinning the request method + path (so a wrong
 // endpoint — like the pre-fix DetectDrift /drift/detect — is caught), and the
@@ -1629,5 +1646,198 @@ func TestRAGAndModerationMethods(t *testing.T) {
 	}
 	if _, err := c.DetectMediaDeepfake(ctx, &DetectMediaDeepfakeRequest{OrgID: "o", ProjectID: "p"}); err == nil {
 		t.Fatal("DetectMediaDeepfake without media should error")
+	}
+}
+
+// ─── E2E audit regressions (2026-07-15) ──────────────────────────────────────
+// The live-prod SDK audit found four Go client contract bugs. Each test below
+// pins the corrected wire behavior so the fix can't silently regress.
+
+// TestGetSecurityReport_SendsAssessmentIdQueryParam guards the fix for the
+// query-param bug: the route keys its report store by assessmentId and 400s on
+// "assessmentId query param is required" when the SDK sends "scanId".
+func TestGetSecurityReport_SendsAssessmentIdQueryParam(t *testing.T) {
+	var gotPath, gotQuery string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotQuery = r.URL.RawQuery
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"success":true,"data":{"summary":"ok"}}`))
+	}))
+	defer srv.Close()
+
+	c, err := NewClient("eg_test", WithBaseURL(srv.URL))
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	res, err := c.GetSecurityReport(context.Background(), "assess-123")
+	if err != nil {
+		t.Fatalf("GetSecurityReport: %v", err)
+	}
+	if gotPath != "/security/report" {
+		t.Fatalf("path: want /security/report, got %s", gotPath)
+	}
+	if !strings.Contains(gotQuery, "assessmentId=assess-123") {
+		t.Errorf("query %q must contain assessmentId=assess-123", gotQuery)
+	}
+	if strings.Contains(gotQuery, "scanId") {
+		t.Errorf("query %q must not contain the old scanId param", gotQuery)
+	}
+	if res["summary"] != "ok" {
+		t.Errorf("unexpected result: %v", res)
+	}
+}
+
+// TestGetMarketplace_DecodesJSONArray guards the fix for the decode bug:
+// GET /marketplace replies with apiSuccess(<array>), so a map[string]any target
+// failed with "cannot unmarshal array into Go value of type
+// map[string]interface{}". The return type is now a slice.
+func TestGetMarketplace_DecodesJSONArray(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/marketplace" {
+			http.Error(w, "wrong path: "+r.URL.Path, http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"success":true,"data":[{"id":"t1","name":"Alpha"},{"id":"t2","name":"Beta"}]}`))
+	}))
+	defer srv.Close()
+
+	c, err := NewClient("eg_test", WithBaseURL(srv.URL))
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	res, err := c.GetMarketplace(context.Background())
+	if err != nil {
+		t.Fatalf("GetMarketplace: %v (a map target would fail to unmarshal the array)", err)
+	}
+	if len(res) != 2 {
+		t.Fatalf("want 2 templates, got %d: %v", len(res), res)
+	}
+	if res[0]["name"] != "Alpha" || res[1]["id"] != "t2" {
+		t.Errorf("unexpected rows: %v", res)
+	}
+}
+
+// TestCheckCompliance_SendsFullContractBody guards the fix for the body-shape
+// bug: POST /compliance/check requires {orgId, framework, model, provider,
+// systemPrompt, apiKey}; the old {orgId, frameworks} shape 400'd every call.
+func TestCheckCompliance_SendsFullContractBody(t *testing.T) {
+	var gotMethod, gotPath string
+	var gotBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		gotBody = map[string]any{}
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &gotBody)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"success":true,"data":{"assessmentId":"a1","status":"compliant"}}`))
+	}))
+	defer srv.Close()
+
+	c, err := NewClient("eg_test", WithBaseURL(srv.URL))
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	// nil request → client-side validation error, no HTTP call.
+	if _, err := c.CheckCompliance(context.Background(), nil); err == nil {
+		t.Fatal("nil request should error")
+	}
+
+	res, err := c.CheckCompliance(context.Background(), &ComplianceCheckRequest{
+		OrgID:        "org-1",
+		Framework:    "eu-ai-act",
+		Model:        "gpt-4o",
+		Provider:     "openai",
+		SystemPrompt: "You are helpful.",
+		APIKey:       "sk-x",
+	})
+	if err != nil {
+		t.Fatalf("CheckCompliance: %v", err)
+	}
+	if gotMethod != http.MethodPost || gotPath != "/compliance/check" {
+		t.Fatalf("want POST /compliance/check, got %s %s", gotMethod, gotPath)
+	}
+	for _, k := range []string{"orgId", "framework", "model", "provider", "systemPrompt", "apiKey"} {
+		if _, ok := gotBody[k]; !ok {
+			t.Errorf("body missing required field %q: %v", k, gotBody)
+		}
+	}
+	if _, ok := gotBody["frameworks"]; ok {
+		t.Errorf("body must not send the old plural 'frameworks' field: %v", gotBody)
+	}
+	// Unset optional fields must be omitted (omitempty), not sent as zero values.
+	for _, k := range []string{"timeout", "baseUrl", "projectId"} {
+		if _, ok := gotBody[k]; ok {
+			t.Errorf("optional field %q should be omitted when unset: %v", k, gotBody)
+		}
+	}
+	if gotBody["framework"] != "eu-ai-act" {
+		t.Errorf("framework: want eu-ai-act, got %v", gotBody["framework"])
+	}
+	if res["assessmentId"] != "a1" {
+		t.Errorf("unexpected result: %v", res)
+	}
+}
+
+// TestHandleErrorResponse_SurfacesServerCodeAndCategory guards the fix for the
+// error-mapping bug: every non-{401,403,404,422,429} status collapsed to
+// INTERNAL_ERROR, mislabeling 400 validation failures and discarding the
+// server's structured error.code. handleErrorResponse is unit-tested directly
+// so the 5xx cases don't pay the retry/backoff cost.
+func TestHandleErrorResponse_SurfacesServerCodeAndCategory(t *testing.T) {
+	c, err := NewClient("eg_test")
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	cases := []struct {
+		name       string
+		status     int
+		body       string
+		wantCode   ErrorCode
+		wantMsgSub string
+	}{
+		{"400 surfaces server VALIDATION_ERROR", 400,
+			`{"success":false,"error":{"code":"VALIDATION_ERROR","message":"assessmentId is required"}}`,
+			ErrCodeValidation, "assessmentId is required"},
+		{"400 surfaces non-standard server code verbatim", 400,
+			`{"success":false,"error":{"code":"INVALID_ID","message":"bad id"}}`,
+			ErrorCode("INVALID_ID"), "bad id"},
+		{"400 without a code maps to validation, not internal", 400,
+			`{"success":false,"error":{"message":"nope"}}`,
+			ErrCodeValidation, "nope"},
+		{"409 with a server code surfaces it", 409,
+			`{"success":false,"error":{"code":"CONFLICT","message":"dup"}}`,
+			ErrorCode("CONFLICT"), "dup"},
+		{"500 without a code stays internal", 500,
+			`{"success":false,"error":{"message":"boom"}}`,
+			ErrCodeInternal, "boom"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := &http.Response{StatusCode: tc.status, Header: http.Header{}}
+			gotErr := c.handleErrorResponse(resp, []byte(tc.body), "req-1")
+			var egErr *EvalGuardError
+			if !asEvalGuardError(gotErr, &egErr) {
+				t.Fatalf("want *EvalGuardError, got %T: %v", gotErr, gotErr)
+			}
+			if egErr.Code != tc.wantCode {
+				t.Errorf("code: want %q, got %q", tc.wantCode, egErr.Code)
+			}
+			if egErr.Code == ErrCodeInternal && tc.status < 500 {
+				t.Errorf("status %d must not map to INTERNAL_ERROR", tc.status)
+			}
+			if !strings.Contains(egErr.Message, tc.wantMsgSub) {
+				t.Errorf("message %q missing %q", egErr.Message, tc.wantMsgSub)
+			}
+			if egErr.StatusCode != tc.status {
+				t.Errorf("status: want %d, got %d", tc.status, egErr.StatusCode)
+			}
+		})
 	}
 }
