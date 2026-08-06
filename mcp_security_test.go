@@ -16,8 +16,17 @@ func TestMcpAgentSecurityMethods(t *testing.T) {
 
 	t.Run("AuditMcpServer", func(t *testing.T) {
 		rec := &recordingServer{}
+		// Backend-shaped report: auditMcpServerConfig() always emits a complete
+		// summary, a riskScore that is Σ SEVERITY_WEIGHT over the findings, and
+		// a verdict DERIVED from the summary. A "block" with an empty findings
+		// array and a partial summary is not a report the auditor can produce.
 		c, cleanup := newRecordingServer(t, http.StatusOK, map[string]any{
-			"verdict": "block", "riskScore": 60, "toolCount": 1, "summary": map[string]any{"critical": 1}, "findings": []any{},
+			"verdict": "block", "riskScore": 40, "toolCount": 1,
+			"summary": map[string]any{"critical": 1, "high": 0, "medium": 0, "low": 0, "total": 1},
+			"findings": []any{map[string]any{
+				"severity": "critical", "category": "tool-description-injection", "target": "tool:x",
+				"title": "Prompt injection in tool description", "detail": "…", "remediation": "…",
+			}},
 		}, rec)
 		defer cleanup()
 		got, err := c.AuditMcpServer(ctx, pid, map[string]any{"id": "s", "authSchemes": []any{}}, []map[string]any{{"name": "x"}})
@@ -43,7 +52,11 @@ func TestMcpAgentSecurityMethods(t *testing.T) {
 
 	t.Run("RunAgentExecRedTeam", func(t *testing.T) {
 		rec := &recordingServer{}
-		c, cleanup := newRecordingServer(t, http.StatusOK, map[string]any{"verdict": "breached", "breaches": 1, "totalAttacks": 5}, rec)
+		// `breaches` is a SUBSET of `dangerousAttempts` in runAgentExecRedTeam
+		// (both filter the same `attacks` slice), so a breach with zero
+		// dangerous attempts is not a result the engine can produce.
+		c, cleanup := newRecordingServer(t, http.StatusOK,
+			map[string]any{"verdict": "breached", "breaches": 1, "dangerousAttempts": 2, "totalAttacks": 5}, rec)
 		defer cleanup()
 		got, err := c.RunAgentExecRedTeam(ctx, pid, "openai", "gpt-4o-mini", nil)
 		if err != nil {

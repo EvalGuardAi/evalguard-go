@@ -494,19 +494,30 @@ func TestCheckFirewall_ServerError_SurfacesNestedMessage(t *testing.T) {
 func TestCheckFirewall_EmptyDataField(t *testing.T) {
 	// Server returns 200 but no `data` field (a contract violation — every v1
 	// route replies through apiSuccess(data)). The central envelope unwrap
-	// degrades gracefully: it falls back to decoding the whole body, yielding a
-	// zero-valued result rather than crashing. No error, Blocked=false.
+	// falls back to decoding the whole body, which for `{}` yields a
+	// zero-valued struct.
+	//
+	// REWRITTEN 2026-08-03. This test previously asserted "No error,
+	// Blocked=false" and called that graceful degradation — i.e. it PINNED the
+	// fail-open as the contract. It is not graceful: Blocked==false is
+	// indistinguishable from a real allow, so `if resp.Blocked { deny }` let
+	// content through a firewall that never ran. The zero value is not a
+	// verdict, and the SDK must say so.
 	c, cleanup := newCheckFirewallTestServer(t, http.StatusOK, map[string]any{}, nil)
 	defer cleanup()
 	resp, err := c.CheckFirewall(context.Background(), &FirewallCheckRequest{Input: "x"})
-	if err != nil {
-		t.Fatalf("unexpected error for empty data field: %v", err)
+	if err == nil {
+		t.Fatalf("FAIL-OPEN: a 200 with no verdict returned no error (resp=%+v)", resp)
 	}
-	if resp == nil {
-		t.Fatal("expected non-nil result, got nil")
+	if resp != nil {
+		t.Errorf("an indeterminate verdict must not hand back a readable result; got %+v", resp)
 	}
-	if resp.Blocked {
-		t.Errorf("expected Blocked=false on empty body, got true")
+	var egErr *EvalGuardError
+	if !asEvalGuardError(err, &egErr) {
+		t.Fatalf("expected *EvalGuardError, got %T: %v", err, err)
+	}
+	if egErr.Code != ErrCodeIndeterminate {
+		t.Errorf("Code: want %q, got %q", ErrCodeIndeterminate, egErr.Code)
 	}
 }
 
@@ -1527,6 +1538,8 @@ func TestClientVersionHeaderSent(t *testing.T) {
 // TestUserAgentMatchesClientVersion guards the regression the SDK audit found:
 // userAgent had drifted to "evalguard-go/1.2.0" while clientVersion said "1.4.0".
 // The version embedded in the User-Agent must stay in lockstep with clientVersion.
+// userAgent is now DERIVED from clientVersion (see the const block), so this can
+// never diverge — the check documents and locks in that invariant.
 func TestUserAgentMatchesClientVersion(t *testing.T) {
 	const prefix = "evalguard-go/"
 	if !strings.HasPrefix(userAgent, prefix) {
@@ -1536,6 +1549,101 @@ func TestUserAgentMatchesClientVersion(t *testing.T) {
 	if uaVersion != clientVersion {
 		t.Errorf("userAgent version %q must match clientVersion %q", uaVersion, clientVersion)
 	}
+}
+
+// TestClientVersionIsCurrentRelease pins the SDK version to the intended
+// release so the userAgent/clientVersion/git-tag trio can't silently drift
+// again. Published module tag is go-sdk-v1.4.2, so the next release — and the
+// value both the client-version header and the User-Agent must advertise — is
+// 1.5.0 (MINOR: the indeterminate-verdict refusal is a behaviour change; see
+// the const block). Bump BOTH this constant and this assertion together each
+// release.
+func TestClientVersionIsCurrentRelease(t *testing.T) {
+	const wantVersion = "1.5.0"
+	if clientVersion != wantVersion {
+		t.Errorf("clientVersion: want %q, got %q", wantVersion, clientVersion)
+	}
+	if want := "evalguard-go/" + wantVersion; userAgent != want {
+		t.Errorf("userAgent: want %q, got %q", want, userAgent)
+	}
+}
+
+// TestFetchTraceAttachment_RetriesAndTypedError guards the 2026-07-22 E2E fix:
+// FetchTraceAttachment used to hand-roll its own HTTP request — skipping the
+// shared retry/backoff loop and returning an unstructured fmt.Errorf("HTTP %d")
+// string. It now routes through doRaw like every sibling method, so a transient
+// 5xx is retried and a failure surfaces as the typed *EvalGuardError. Both
+// subtests fail against the pre-fix implementation (no retry → 1 attempt; the
+// error is a bare *errors.errorString that asEvalGuardError can't unwrap).
+func TestFetchTraceAttachment_RetriesAndTypedError(t *testing.T) {
+	t.Run("retries transient 5xx then succeeds", func(t *testing.T) {
+		var attempts int
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			attempts++
+			// Fail the first two attempts with 503, succeed on the third —
+			// exercising the exponential-backoff retry loop.
+			if attempts < 3 {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_ = json.NewEncoder(w).Encode(map[string]any{"message": "transient"})
+				return
+			}
+			w.Header().Set("Content-Type", "application/pdf")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("%PDF-bytes"))
+		}))
+		defer srv.Close()
+
+		c, err := NewClient("eg_test", WithBaseURL(srv.URL), WithTimeout(5*time.Second))
+		if err != nil {
+			t.Fatalf("NewClient: %v", err)
+		}
+		data, contentType, err := c.FetchTraceAttachment(context.Background(), "trace-1", "att-1", "proj-1")
+		if err != nil {
+			t.Fatalf("FetchTraceAttachment after retries: %v", err)
+		}
+		if attempts != 3 {
+			t.Fatalf("expected 3 attempts (proves the retry loop ran), got %d", attempts)
+		}
+		if string(data) != "%PDF-bytes" {
+			t.Errorf("data: want %q, got %q", "%PDF-bytes", string(data))
+		}
+		if contentType != "application/pdf" {
+			t.Errorf("contentType: want %q, got %q", "application/pdf", contentType)
+		}
+	})
+
+	t.Run("typed EvalGuardError on failure", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusNotFound)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"success": false,
+				"error":   map[string]any{"code": "NOT_FOUND", "message": "attachment not found"},
+			})
+		}))
+		defer srv.Close()
+
+		c, err := NewClient("eg_test", WithBaseURL(srv.URL), WithTimeout(5*time.Second))
+		if err != nil {
+			t.Fatalf("NewClient: %v", err)
+		}
+		_, _, err = c.FetchTraceAttachment(context.Background(), "trace-1", "missing", "proj-1")
+		if err == nil {
+			t.Fatal("expected error for 404, got nil")
+		}
+		var egErr *EvalGuardError
+		if !asEvalGuardError(err, &egErr) {
+			t.Fatalf("want a typed *EvalGuardError, got %T: %v", err, err)
+		}
+		if egErr.StatusCode != http.StatusNotFound {
+			t.Errorf("StatusCode: want 404, got %d", egErr.StatusCode)
+		}
+		if egErr.Code != ErrCodeNotFound {
+			t.Errorf("Code: want %q, got %q", ErrCodeNotFound, egErr.Code)
+		}
+		if !strings.Contains(egErr.Message, "attachment not found") {
+			t.Errorf("Message: want server reason, got %q", egErr.Message)
+		}
+	})
 }
 
 // TestRAGAndModerationMethods exercises the RAG + multimodal-moderation client
@@ -1557,7 +1665,10 @@ func TestRAGAndModerationMethods(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		if r.URL.Path == "/security/rag-injection-scan" {
-			_, _ = w.Write([]byte(`{"success":true,"data":{"scanned":2,"clean":false,"poisonedCount":1,"poisonedIndices":[1],"violations":[{"severity":"high","index":1}]}}`))
+			// Violation shape is the backend's ChunkScanViolation (`chunkIndex`,
+			// not `index`) — the drop-list is now checked against it, so a
+			// fixture that misnames the field is not a healthy response.
+			_, _ = w.Write([]byte(`{"success":true,"data":{"scanned":2,"clean":false,"poisonedCount":1,"poisonedIndices":[1],"violations":[{"chunkIndex":1,"check":"prompt-injection","severity":"critical","message":"Instruction-override payload"}]}}`))
 			return
 		}
 		_, _ = w.Write([]byte(`{"success":true,"data":{"ok":true}}`))
@@ -1984,5 +2095,39 @@ func TestCreateAnnotation_ValidatesLabel(t *testing.T) {
 			t.Errorf("body wrong for label %q: %v", label, rec.body)
 		}
 		cleanup()
+	}
+}
+
+func TestListScorers(t *testing.T) {
+	var gotMethod, gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		// GET /scorers returns apiSuccess({scorers:[...], total}) — an ENVELOPED
+		// OBJECT, not a bare array; ListScorers must unwrap data.scorers.
+		_, _ = w.Write([]byte(`{"success":true,"data":{"scorers":[` +
+			`{"id":"exact-match","name":"Exact Match","description":"d","type":"deterministic"}` +
+			`],"total":1}}`))
+	}))
+	defer srv.Close()
+
+	c, err := NewClient("eg_test", WithBaseURL(srv.URL), WithTimeout(5*time.Second))
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	scorers, err := c.ListScorers(context.Background())
+	if err != nil {
+		t.Fatalf("ListScorers: %v", err)
+	}
+	if gotMethod != http.MethodGet || gotPath != "/scorers" {
+		t.Fatalf("expected GET /scorers, got %s %s", gotMethod, gotPath)
+	}
+	if len(scorers) != 1 {
+		t.Fatalf("expected 1 scorer, got %d", len(scorers))
+	}
+	if scorers[0].ID != "exact-match" || scorers[0].Name != "Exact Match" || scorers[0].Type != "deterministic" {
+		t.Fatalf("unexpected scorer: %+v", scorers[0])
 	}
 }
