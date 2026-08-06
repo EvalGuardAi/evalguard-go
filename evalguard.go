@@ -30,6 +30,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	mrand "math/rand"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -41,16 +42,70 @@ import (
 const (
 	maxRetries     = 3
 	baseRetryDelay = 500 * time.Millisecond
+	// maxRetryDelay is a HARD ceiling on any single retry sleep.
+	//
+	// AUDIT 2026-07-25 (availability): doRaw used to sleep for
+	// rateLimitErr.RetryAfter verbatim, and RetryAfter was taken straight from
+	// the server's Retry-After header with no upper bound (defaulting to 60s
+	// when absent). A hostile or merely mis-set `Retry-After: 3600` from an
+	// intermediary WAF/CDN under load shedding parked the caller for an hour
+	// per attempt — up to 2 hours on one logical call — while
+	// c.httpClient.Timeout bounded only each exchange, never the sleep. A Go
+	// service calling CheckFirewall inline on its request path with
+	// context.Background() piled up goroutines until it fell over. Java already
+	// clamps this (EvalGuardClient MAX_BACKOFF); Go was never migrated.
+	maxRetryDelay = 10 * time.Second
+	// retryAfterFallback is used when the server sends no parseable
+	// Retry-After. Jittered by jitteredDelay, like every other branch.
+	retryAfterFallback = 5 * time.Second
 )
+
+// clampRetryDelay bounds any retry sleep to maxRetryDelay. A server-supplied
+// Retry-After may SHORTEN a wait; it may never extend it past the ceiling.
+// Negative/zero values collapse to the exponential base so a bogus header can
+// neither hang nor busy-loop the caller.
+func clampRetryDelay(d time.Duration) time.Duration {
+	if d <= 0 {
+		return baseRetryDelay
+	}
+	if d > maxRetryDelay {
+		return maxRetryDelay
+	}
+	return d
+}
+
+// jitteredDelay applies +-50% jitter to a (already clamped) delay so N clients
+// that hit the same 429/5xx do not wake together and re-stampede the origin.
+// math/rand is fine here: this is scheduling noise, not a secret.
+func jitteredDelay(d time.Duration) time.Duration {
+	d = clampRetryDelay(d)
+	return time.Duration(float64(d) * (0.5 + mrand.Float64()*0.5))
+}
 
 const (
 	DefaultBaseURL = "https://evalguard.ai/api/v1"
 	DefaultTimeout = 30 * time.Second
-	userAgent      = "evalguard-go/1.4.2"
-	// clientVersion is sent as x-evalguard-client-version on every request so an
-	// org that pins allowed client versions can enforce its policy on this SDK
-	// (deep-audit 2026-06-21). Keep in lockstep with userAgent above.
-	clientVersion = "1.4.2"
+	// clientVersion is the SINGLE source of truth for this SDK's version. It is
+	// sent as x-evalguard-client-version on every request so an org that pins
+	// allowed client versions can enforce its policy on this SDK (deep-audit
+	// 2026-06-21). Bump this ONE constant per release and tag the module to
+	// match — published go-sdk-v1.4.2, so the next release is go-sdk-v1.5.0.
+	//
+	// 2026-08-03: was 1.4.3 (an unreleased PATCH). MINOR, not PATCH, because
+	// this tree now carries a deliberate BEHAVIOUR change since 1.4.2:
+	// CheckFirewall / CheckFirewallAdvanced / AuditMcpServer /
+	// RunAgentExecRedTeam / ScanRAGInjection return ErrCodeIndeterminate
+	// instead of a zero-valued struct when the 2xx carried no verdict, plus new
+	// public API (HasVerdict on four result types). Reusing a number that is
+	// already in the wild under different behaviour is exactly what hid the
+	// published-vs-repo drift in the Java SDK at 1.0.8.
+	clientVersion = "1.5.0"
+	// userAgent is DERIVED from clientVersion (constant string concatenation is
+	// evaluated at compile time, so this stays a plain const) so the two can
+	// never drift. A prior audit found a hardcoded "evalguard-go/1.2.0" literal
+	// here while clientVersion said 1.4.0 — deriving it deletes the second magic
+	// string that made that regression possible.
+	userAgent = "evalguard-go/" + clientVersion
 )
 
 // ErrorCode represents categorized API error codes.
@@ -65,7 +120,70 @@ const (
 	ErrCodeInternal       ErrorCode = "INTERNAL_ERROR"
 	ErrCodeTimeout        ErrorCode = "TIMEOUT"
 	ErrCodeNetworkFailure ErrorCode = "NETWORK_FAILURE"
+	// ErrCodeIndeterminate is returned when the server answered 2xx but the
+	// body carried NO decision field, so the security verdict could not be
+	// read. It is deliberately distinct from every other code: an
+	// indeterminate verdict is neither "allowed" nor a transport failure, and
+	// it must never be collapsed into either.
+	//
+	// AUDIT 2026-08-03 (fail-open sweep, CLASS 1). Go's zero value is the same
+	// hazard Jackson's primitive default was in the published Java SDK 1.0.8:
+	// json.Unmarshal does NOT error on a missing key, so `Blocked bool` stays
+	// false and every caller's `if resp.Blocked { deny }` reads ALLOW for a
+	// 200 that is not a verdict at all — schema drift, a proxy/WAF
+	// substituting its own envelope on a 2xx, a truncated body, `{}`,
+	// `{"data":null}`. There are THREE outcomes, not two: blocked, allowed,
+	// and NO VERDICT. A response the client cannot INTERPRET must DENY.
+	ErrCodeIndeterminate ErrorCode = "INDETERMINATE_VERDICT"
 )
+
+// indeterminateVerdict builds the refusal returned when a 2xx response carries
+// no decision field. The message names the MISSING field so an operator can
+// tell schema drift from an outage at a glance, and callers can branch on
+// ErrCodeIndeterminate.
+func indeterminateVerdict(method, field, route string) error {
+	return &EvalGuardError{
+		Code: ErrCodeIndeterminate,
+		Message: fmt.Sprintf(
+			"%s: %s returned 2xx with no `%s` field, so the security verdict is INDETERMINATE — "+
+				"the content was NOT evaluated and must not be treated as allowed",
+			method, route, field),
+	}
+}
+
+// uninterpretableVerdict is the SAME refusal for the other half of the class:
+// the decision field is PRESENT but the client cannot act on it — a verdict
+// string outside the server's closed set, or a verdict that contradicts the
+// rest of the body. It deliberately carries ErrCodeIndeterminate too: from a
+// caller's point of view "no verdict" and "a verdict I cannot interpret" are
+// the same third outcome, and a caller already branching on
+// ErrCodeIndeterminate must catch both without a code change.
+//
+// AUDIT 2026-08-03. Presence was being checked where VALIDITY was required.
+// `HasVerdict()` returning true for ANY non-empty string meant a case-drifted
+// or newer verdict ("Block", "PASS", "quarantine") satisfied the gate and a
+// server the audit scored 98/100 got deployed. Same shape as the RAG scan
+// reporting poison it could not attribute to any document.
+func uninterpretableVerdict(method, route, reason string) error {
+	return &EvalGuardError{
+		Code: ErrCodeIndeterminate,
+		Message: fmt.Sprintf(
+			"%s: %s returned 2xx but the security verdict is UNINTERPRETABLE (%s) — "+
+				"the result must NOT be treated as allowed",
+			method, route, reason),
+	}
+}
+
+// quoteVerdict renders an untrusted verdict string for an operator message.
+// Bounded on purpose: the value is attacker-influenceable server output that
+// lands in application logs, so it is truncated rather than echoed whole.
+func quoteVerdict(s string) string {
+	const max = 48
+	if len(s) > max {
+		return fmt.Sprintf("%q(+%d more bytes)", s[:max], len(s)-max)
+	}
+	return fmt.Sprintf("%q", s)
+}
 
 // EvalGuardError is the base error type for all SDK errors.
 type EvalGuardError struct {
@@ -767,6 +885,30 @@ func (c *Client) CalibrateScorer(ctx context.Context, req *CalibrateScorerReques
 	return result, nil
 }
 
+// Scorer is a platform scorer (a built-in evaluator the eval engine can run).
+type Scorer struct {
+	ID          string          `json:"id"`
+	Name        string          `json:"name"`
+	Description string          `json:"description"`
+	Type        string          `json:"type,omitempty"`
+	Config      json.RawMessage `json:"config,omitempty"`
+}
+
+// ListScorers returns every scorer the platform exposes. Mirrors the npm/Python
+// listScorers — Go (and Java) previously had no scorer-listing method at all.
+//
+// GET /scorers replies with an enveloped object ({data: {scorers: [...], total}}),
+// so this unwraps data.scorers rather than treating data as a bare array.
+func (c *Client) ListScorers(ctx context.Context) ([]Scorer, error) {
+	var payload struct {
+		Scorers []Scorer `json:"scorers"`
+	}
+	if err := c.doRequest(ctx, http.MethodGet, "/scorers", nil, &payload); err != nil {
+		return nil, fmt.Errorf("ListScorers: %w", err)
+	}
+	return payload.Scorers, nil
+}
+
 // --- Shadow AI ---
 
 // ShadowAIRequest contains parameters for shadow AI analysis.
@@ -1271,6 +1413,19 @@ type FirewallLayerHit struct {
 // classifier verdicts; both are empty strings when no layer triggered.
 // Hits is the per-layer breakdown of any triggered layers — an empty
 // slice means the input scored below all thresholds.
+//
+// AUDIT 2026-08-03 (CLASS 1 fail-open, sibling of published Java 1.0.8):
+// `Blocked` is a plain bool, and Go's zero value is indistinguishable from an
+// explicit `blocked:false`. json.Unmarshal does not error on a missing key, so
+// a 200 that is not a firewall verdict decoded cleanly into Blocked==false and
+// every caller's `if resp.Blocked` read ALLOW for content the firewall never
+// evaluated. Measured before the fix, a body of
+// `{"success":true,"data":{"score":0.97,"category":"prompt-injection"}}`
+// produced Score=0.97, Category="prompt-injection", Blocked=false, err=nil.
+//
+// The presence of the wire field is now tracked separately (see
+// UnmarshalJSON / HasVerdict), and the client methods REFUSE rather than hand
+// back a verdict they did not receive.
 type FirewallCheckResponse struct {
 	Blocked     bool               `json:"blocked"`
 	Score       float64            `json:"score"`
@@ -1278,7 +1433,46 @@ type FirewallCheckResponse struct {
 	Subcategory string             `json:"subcategory,omitempty"`
 	LatencyMs   float64            `json:"latencyMs"`
 	Hits        []FirewallLayerHit `json:"hits,omitempty"`
+
+	// blockedPresent records whether the decoded body actually carried a
+	// boolean `blocked`. Unexported so it can never be set by a caller and
+	// never round-trips onto the wire.
+	blockedPresent bool
 }
+
+// UnmarshalJSON decodes the response and, separately, records whether the wire
+// carried a boolean `blocked` at all. An explicit `blocked:false` (a real
+// allow) and an absent `blocked` (no verdict) are INDISTINGUISHABLE by value;
+// only presence separates them.
+//
+// The `alias` indirection is what keeps this from recursing: a defined type
+// with the same underlying struct has an empty method set, so the nested
+// json.Unmarshal uses the default struct decoder and every other field is
+// still populated exactly as before.
+func (r *FirewallCheckResponse) UnmarshalJSON(data []byte) error {
+	type alias FirewallCheckResponse
+	var probe struct {
+		Blocked *bool `json:"blocked"`
+	}
+	if err := json.Unmarshal(data, &probe); err != nil {
+		return err
+	}
+	var decoded alias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*r = FirewallCheckResponse(decoded)
+	r.blockedPresent = probe.Blocked != nil
+	return nil
+}
+
+// HasVerdict reports whether the response actually carried a firewall verdict.
+//
+// POST /api/v1/firewall/check always emits a boolean `blocked`, so false here
+// means the body did not come from the firewall. Never branch on Blocked
+// without it — the client methods already refuse on your behalf, but a caller
+// that decodes a stored/proxied body itself must check this.
+func (r *FirewallCheckResponse) HasVerdict() bool { return r != nil && r.blockedPresent }
 
 // CheckFirewall runs a single input through the firewall engine.
 //
@@ -1298,6 +1492,13 @@ func (c *Client) CheckFirewall(ctx context.Context, req *FirewallCheckRequest) (
 	var result FirewallCheckResponse
 	if err := c.doRequest(ctx, http.MethodPost, "/firewall/check", req, &result); err != nil {
 		return nil, fmt.Errorf("CheckFirewall: %w", err)
+	}
+	// A 2xx that carries no `blocked` field is NOT an allow — the firewall did
+	// not evaluate this input. Returning (nil, err) rather than a decoded
+	// struct is deliberate: an indeterminate verdict must not be readable, or
+	// the zero value becomes the answer again at the next call site.
+	if !result.HasVerdict() {
+		return nil, indeterminateVerdict("CheckFirewall", "blocked", "POST /firewall/check")
 	}
 	return &result, nil
 }
@@ -1486,6 +1687,13 @@ func (c *Client) CheckFirewallAdvanced(ctx context.Context, input string, rules 
 	var result FirewallCheckResponse
 	if err := c.doRequest(ctx, http.MethodPost, "/firewall/check", body, &result); err != nil {
 		return nil, fmt.Errorf("CheckFirewallAdvanced: %w", err)
+	}
+	// Same refusal as CheckFirewall — this is the second entry point onto the
+	// same route, and CheckFirewallOutputAdvanced delegates here, so a gap
+	// would also be a gap in model-OUTPUT screening (PII / secret leak /
+	// system-prompt leak).
+	if !result.HasVerdict() {
+		return nil, indeterminateVerdict("CheckFirewallAdvanced", "blocked", "POST /firewall/check")
 	}
 	return &result, nil
 }
@@ -2462,34 +2670,22 @@ func (c *Client) UploadTraceAttachment(ctx context.Context, req UploadAttachment
 
 // FetchTraceAttachment downloads the raw bytes of an attachment.
 // The returned Content-Type corresponds to the stored mime_type.
+//
+// Like every sibling method, this goes through the shared retry/backoff loop
+// (doRaw), so a transient 429/5xx is retried with Retry-After honored, and a
+// failure surfaces as the typed *EvalGuardError the rest of the SDK returns.
+// It previously hand-rolled its own request — skipping the retry loop and
+// returning an unstructured fmt.Errorf("HTTP %d") string that callers could
+// not errors.As into an *EvalGuardError / *AuthError / *RateLimitError.
 func (c *Client) FetchTraceAttachment(ctx context.Context, traceID, attachmentID, projectID string) ([]byte, string, error) {
 	q := url.Values{}
 	q.Set("projectId", projectID)
-	fullURL := c.baseURL + fmt.Sprintf("/traces/%s/attachments/%s?%s", url.PathEscape(traceID), url.PathEscape(attachmentID), q.Encode())
-	reqHTTP, err := http.NewRequestWithContext(ctx, http.MethodGet, fullURL, nil)
+	path := fmt.Sprintf("/traces/%s/attachments/%s?%s", url.PathEscape(traceID), url.PathEscape(attachmentID), q.Encode())
+	respBody, header, err := c.doRaw(ctx, http.MethodGet, path, "application/octet-stream", nil)
 	if err != nil {
 		return nil, "", fmt.Errorf("FetchTraceAttachment: %w", err)
 	}
-	reqHTTP.Header.Set("Authorization", "Bearer "+c.apiKey)
-	reqHTTP.Header.Set("Accept", "application/octet-stream")
-	reqHTTP.Header.Set("User-Agent", userAgent)
-	reqHTTP.Header.Set("x-evalguard-client-version", clientVersion)
-
-	resp, err := c.httpClient.Do(reqHTTP)
-	if err != nil {
-		return nil, "", fmt.Errorf("FetchTraceAttachment: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 400 {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, "", fmt.Errorf("FetchTraceAttachment: HTTP %d: %s", resp.StatusCode, string(body))
-	}
-	bytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, "", fmt.Errorf("FetchTraceAttachment: %w", err)
-	}
-	return bytes, resp.Header.Get("Content-Type"), nil
+	return respBody, header.Get("Content-Type"), nil
 }
 
 func (c *Client) DeleteTraceAttachment(ctx context.Context, traceID, attachmentID, projectID string) error {
@@ -3195,6 +3391,299 @@ func (c *Client) ForgetMemory(ctx context.Context, projectID, sessionKey string)
 	return result.Forgotten, nil
 }
 
+// --- Agent-memory governance policy (admin-managed durable-write governance) ---
+//
+// Mirrors the provider-keys / models-registry CRUD pattern above: an org-scoped
+// (optionally project-scoped) resource read/upserted/deleted via orgId +
+// optional projectId query params. Admin role required on every verb; the
+// server audits each write. See GET/PUT/DELETE /api/v1/agent-memory/governance.
+
+// MemoryGovernanceMode is a policy's enforcement posture:
+//   - "off"     — allow everything (governance inert).
+//   - "monitor" — record would-be verdicts, but never block a write.
+//   - "enforce" — verdicts act (block / require approval).
+type MemoryGovernanceMode string
+
+const (
+	MemoryGovernanceOff     MemoryGovernanceMode = "off"
+	MemoryGovernanceMonitor MemoryGovernanceMode = "monitor"
+	MemoryGovernanceEnforce MemoryGovernanceMode = "enforce"
+)
+
+// MemoryGovernanceThresholds tunes the numeric governance signals.
+type MemoryGovernanceThresholds struct {
+	// PoisonMinConfidence is the minimum poisoning-screen confidence (0..1)
+	// required to act on a flagged memory. Nil leaves the server default.
+	PoisonMinConfidence *float64 `json:"poisonMinConfidence,omitempty"`
+}
+
+// MemoryGovernanceConfig is the tunable knob set stored on a policy (the DB
+// `config` JSONB). Every field is optional — an empty config keeps server
+// defaults for the omitted knobs.
+type MemoryGovernanceConfig struct {
+	Thresholds *MemoryGovernanceThresholds `json:"thresholds,omitempty"`
+	// RequireApprovalOnRewrite gates consolidate/rewrite writes behind HITL approval.
+	RequireApprovalOnRewrite *bool `json:"requireApprovalOnRewrite,omitempty"`
+	// RequireProvenance flags any governed memory that lacks a non-empty source.
+	RequireProvenance *bool `json:"requireProvenance,omitempty"`
+}
+
+// MemoryGovernancePolicy is the admin-managed governance policy for durable
+// agent-memory writes in an org (optionally scoped to a project). ProjectID and
+// CreatedBy are nil for an org-wide, system-seeded policy respectively.
+type MemoryGovernancePolicy struct {
+	ID        string                 `json:"id"`
+	OrgID     string                 `json:"orgId"`
+	ProjectID *string                `json:"projectId"`
+	Enabled   bool                   `json:"enabled"`
+	Mode      MemoryGovernanceMode   `json:"mode"`
+	Config    MemoryGovernanceConfig `json:"config"`
+	CreatedBy *string                `json:"createdBy"`
+	CreatedAt string                 `json:"createdAt"`
+	UpdatedAt string                 `json:"updatedAt"`
+}
+
+// SetAgentMemoryGovernanceRequest is the upsert body for the org(+project)
+// policy. Only OrgID is required; each omitted field keeps its existing value
+// (or the server default on first insert).
+type SetAgentMemoryGovernanceRequest struct {
+	OrgID     string                  `json:"orgId"`
+	ProjectID *string                 `json:"projectId,omitempty"`
+	Enabled   *bool                   `json:"enabled,omitempty"`
+	Mode      MemoryGovernanceMode    `json:"mode,omitempty"`
+	Config    *MemoryGovernanceConfig `json:"config,omitempty"`
+}
+
+// GetAgentMemoryGovernance reads the org's memory-governance policy for the
+// given project scope (pass nil projectID for the org-wide policy). Returns a
+// nil policy (and nil error) when none is configured. Admin role required.
+// GET /api/v1/agent-memory/governance.
+func (c *Client) GetAgentMemoryGovernance(ctx context.Context, orgID string, projectID *string) (*MemoryGovernancePolicy, error) {
+	if orgID == "" {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "GetAgentMemoryGovernance: orgID is required"}
+	}
+	q := url.Values{}
+	q.Set("orgId", orgID)
+	if projectID != nil {
+		q.Set("projectId", *projectID)
+	}
+	var result struct {
+		Policy *MemoryGovernancePolicy `json:"policy"`
+	}
+	if err := c.doRequest(ctx, http.MethodGet, "/agent-memory/governance?"+q.Encode(), nil, &result); err != nil {
+		return nil, fmt.Errorf("GetAgentMemoryGovernance: %w", err)
+	}
+	return result.Policy, nil
+}
+
+// SetAgentMemoryGovernance upserts the org(+project) memory-governance policy
+// and returns the stored row. Admin role required; the write is audited
+// server-side. PUT /api/v1/agent-memory/governance.
+func (c *Client) SetAgentMemoryGovernance(ctx context.Context, req SetAgentMemoryGovernanceRequest) (*MemoryGovernancePolicy, error) {
+	if req.OrgID == "" {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "SetAgentMemoryGovernance: OrgID is required"}
+	}
+	var result struct {
+		Policy MemoryGovernancePolicy `json:"policy"`
+	}
+	if err := c.doRequest(ctx, http.MethodPut, "/agent-memory/governance", req, &result); err != nil {
+		return nil, fmt.Errorf("SetAgentMemoryGovernance: %w", err)
+	}
+	return &result.Policy, nil
+}
+
+// DeleteAgentMemoryGovernance removes the org(+project) memory-governance policy
+// (reverting to no governance) and reports whether a row was removed. Admin role
+// required. DELETE /api/v1/agent-memory/governance.
+func (c *Client) DeleteAgentMemoryGovernance(ctx context.Context, orgID string, projectID *string) (bool, error) {
+	if orgID == "" {
+		return false, &EvalGuardError{Code: ErrCodeValidation, Message: "DeleteAgentMemoryGovernance: orgID is required"}
+	}
+	q := url.Values{}
+	q.Set("orgId", orgID)
+	if projectID != nil {
+		q.Set("projectId", *projectID)
+	}
+	var result struct {
+		Deleted bool `json:"deleted"`
+	}
+	if err := c.doRequest(ctx, http.MethodDelete, "/agent-memory/governance?"+q.Encode(), nil, &result); err != nil {
+		return false, fmt.Errorf("DeleteAgentMemoryGovernance: %w", err)
+	}
+	return result.Deleted, nil
+}
+
+// --- Gateway guardrail config (per-project inline guardrail management) ---
+//
+// Mirrors the agent-memory governance CRUD above: an org/project-scoped resource
+// listed / upserted / deleted over GET/POST/DELETE /api/v1/gateway/guardrails.
+// Admin role required on upsert + delete; the server audits each write and busts
+// the gateway loader cache so a change takes effect on the very next proxy request.
+//
+// Each row enables ONE guardrail "vendor" on the project's gateway hot path:
+// either a partner vendor adapter (Lakera / Aporia / Patronus / … — resolved
+// server-side from an API key referenced by SecretRef) or a LOCAL preset that
+// makes NO external call and needs NO secret. The four local vendors are
+// local-firewall, moderated-firewall, and the two Wave-2 agent guardrails
+// data-not-instructions + tool-call-circuit-breaker. The route REJECTS a local
+// vendor that carries a SecretRef (400 SECRET_REF_NOT_ALLOWED) and a non-local
+// vendor that omits one (400 SECRET_REF_REQUIRED), so this client models the
+// split explicitly and fails fast — see LocalGuardrailVendors / IsLocalGuardrailVendor.
+
+// GuardrailFlagAction is the action a guardrail takes on flagged content:
+//   - "block"  — reject the request/response.
+//   - "redact" — strip the flagged span and continue.
+//   - "flag"   — allow but record the verdict.
+type GuardrailFlagAction string
+
+const (
+	GuardrailFlagBlock  GuardrailFlagAction = "block"
+	GuardrailFlagRedact GuardrailFlagAction = "redact"
+	GuardrailFlagFlag   GuardrailFlagAction = "flag"
+)
+
+// LocalGuardrailVendors are the guardrail vendors that run inline with NO
+// external call and therefore MUST NOT carry a SecretRef. The two Wave-2 agent
+// guardrails (data-not-instructions, tool-call-circuit-breaker) join the two
+// content presets (local-firewall, moderated-firewall) here.
+var LocalGuardrailVendors = []string{
+	"local-firewall",
+	"moderated-firewall",
+	"data-not-instructions",
+	"tool-call-circuit-breaker",
+}
+
+// IsLocalGuardrailVendor reports whether vendor is a local (no-secret) guardrail
+// preset. Local vendors forbid a SecretRef; every other (partner) vendor requires one.
+func IsLocalGuardrailVendor(vendor string) bool {
+	for _, v := range LocalGuardrailVendors {
+		if v == vendor {
+			return true
+		}
+	}
+	return false
+}
+
+// GuardrailConfig is one per-project gateway guardrail-config row as returned by
+// the API (snake_case DB columns). SecretRef is nil for a local preset and for a
+// partner vendor whose key binding was cleared.
+type GuardrailConfig struct {
+	ID               string              `json:"id"`
+	OrgID            string              `json:"org_id"`
+	ProjectID        string              `json:"project_id"`
+	Vendor           string              `json:"vendor"`
+	VendorChain      []string            `json:"vendor_chain,omitempty"`
+	FallbackOnErrors []string            `json:"fallback_on_errors,omitempty"`
+	Config           map[string]any      `json:"config,omitempty"`
+	SecretRef        *string             `json:"secret_ref"`
+	OnFlag           GuardrailFlagAction `json:"on_flag"`
+	CheckRequest     bool                `json:"check_request"`
+	CheckResponse    bool                `json:"check_response"`
+	TokenizePii      bool                `json:"tokenize_pii"`
+	Enabled          bool                `json:"enabled"`
+	Priority         int                 `json:"priority"`
+	CreatedAt        string              `json:"created_at"`
+	UpdatedAt        string              `json:"updated_at"`
+}
+
+// UpsertGuardrailConfigRequest is the upsert body for a gateway guardrail-config
+// row (camelCase, matching the POST schema). OrgID, ProjectID and Vendor are
+// required; every other field is optional and keeps the server default on first
+// insert. SecretRef MUST be set for a partner vendor and MUST be nil for a local
+// vendor (see IsLocalGuardrailVendor). Pointer bools/ints distinguish "leave the
+// existing value" (nil) from an explicit false/0.
+type UpsertGuardrailConfigRequest struct {
+	OrgID            string              `json:"orgId"`
+	ProjectID        string              `json:"projectId"`
+	Vendor           string              `json:"vendor"`
+	VendorChain      []string            `json:"vendorChain,omitempty"`
+	FallbackOnErrors []string            `json:"fallbackOnErrors,omitempty"`
+	Config           map[string]any      `json:"config,omitempty"`
+	SecretRef        *string             `json:"secretRef,omitempty"`
+	OnFlag           GuardrailFlagAction `json:"onFlag,omitempty"`
+	CheckRequest     *bool               `json:"checkRequest,omitempty"`
+	CheckResponse    *bool               `json:"checkResponse,omitempty"`
+	TokenizePii      *bool               `json:"tokenizePii,omitempty"`
+	Enabled          *bool               `json:"enabled,omitempty"`
+	Priority         *int                `json:"priority,omitempty"`
+}
+
+// ListGuardrailConfigs returns the project's gateway guardrail-config rows,
+// ordered by priority (ascending). Returns an empty slice (and nil error) when
+// none are configured. Admin auth. GET /api/v1/gateway/guardrails?projectId=….
+func (c *Client) ListGuardrailConfigs(ctx context.Context, projectID string) ([]GuardrailConfig, error) {
+	if projectID == "" {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "ListGuardrailConfigs: projectID is required"}
+	}
+	q := url.Values{}
+	q.Set("projectId", projectID)
+	var result []GuardrailConfig
+	if err := c.doRequest(ctx, http.MethodGet, "/gateway/guardrails?"+q.Encode(), nil, &result); err != nil {
+		return nil, fmt.Errorf("ListGuardrailConfigs: %w", err)
+	}
+	return result, nil
+}
+
+// UpsertGuardrailConfig enables/configures ONE guardrail vendor on the project's
+// gateway hot path and returns the stored row. Idempotent on (projectId, vendor):
+// re-submitting the same vendor updates in place. Admin role required; the write
+// is audited server-side and busts the gateway loader cache.
+// POST /api/v1/gateway/guardrails.
+//
+// The local-vs-vendor SecretRef rule is enforced client-side to fail fast (the
+// server 400s the same mismatches): a LOCAL vendor (see IsLocalGuardrailVendor)
+// must NOT carry a SecretRef; every partner vendor MUST. A supplied VendorChain
+// must lead with the primary Vendor (its (projectId, vendor) upsert key).
+func (c *Client) UpsertGuardrailConfig(ctx context.Context, req UpsertGuardrailConfigRequest) (*GuardrailConfig, error) {
+	if req.OrgID == "" {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "UpsertGuardrailConfig: OrgID is required"}
+	}
+	if req.ProjectID == "" {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "UpsertGuardrailConfig: ProjectID is required"}
+	}
+	if req.Vendor == "" {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "UpsertGuardrailConfig: Vendor is required"}
+	}
+	if IsLocalGuardrailVendor(req.Vendor) {
+		if req.SecretRef != nil {
+			return nil, &EvalGuardError{Code: ErrCodeValidation, Message: fmt.Sprintf("UpsertGuardrailConfig: local guardrail %q makes no external call and must not carry a SecretRef", req.Vendor)}
+		}
+	} else if req.SecretRef == nil {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: fmt.Sprintf("UpsertGuardrailConfig: partner vendor %q requires a SecretRef pointing at a stored provider key", req.Vendor)}
+	}
+	if len(req.VendorChain) > 0 && req.VendorChain[0] != req.Vendor {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: fmt.Sprintf("UpsertGuardrailConfig: VendorChain[0] (%q) must equal Vendor (%q) — the primary", req.VendorChain[0], req.Vendor)}
+	}
+	var result GuardrailConfig
+	if err := c.doRequest(ctx, http.MethodPost, "/gateway/guardrails", req, &result); err != nil {
+		return nil, fmt.Errorf("UpsertGuardrailConfig: %w", err)
+	}
+	return &result, nil
+}
+
+// DeleteGuardrailConfig removes ONE guardrail-config row by id (scoped to the
+// project) and returns the deleted row id. Admin role required; the delete is
+// audited server-side and busts the gateway loader cache.
+// DELETE /api/v1/gateway/guardrails?projectId=…&id=….
+func (c *Client) DeleteGuardrailConfig(ctx context.Context, projectID, id string) (string, error) {
+	if projectID == "" {
+		return "", &EvalGuardError{Code: ErrCodeValidation, Message: "DeleteGuardrailConfig: projectID is required"}
+	}
+	if id == "" {
+		return "", &EvalGuardError{Code: ErrCodeValidation, Message: "DeleteGuardrailConfig: id is required"}
+	}
+	q := url.Values{}
+	q.Set("projectId", projectID)
+	q.Set("id", id)
+	var result struct {
+		Deleted string `json:"deleted"`
+	}
+	if err := c.doRequest(ctx, http.MethodDelete, "/gateway/guardrails?"+q.Encode(), nil, &result); err != nil {
+		return "", fmt.Errorf("DeleteGuardrailConfig: %w", err)
+	}
+	return result.Deleted, nil
+}
+
 // --- Voice ML (word-level ASR + deepfake detection via sidecar) ---
 
 // VoiceWord is a single word with its time span (ms relative to audio start).
@@ -3222,10 +3711,43 @@ type TranscriptResult struct {
 }
 
 // DeepfakeScore is the synthetic-speech detection result; Probability is P(synthetic) in [0,1].
+// DeepfakeScore is the synthetic-speech likelihood for a voice sample.
+//
+// Same CLASS-1 hazard: `Probability` zero-values to 0.0, which is the MOST
+// benign reading on a 0..1 scale, so the natural gate
+// `if score.Probability > threshold { reject }` accepted every sample whose
+// score never arrived. Presence of `probability` on the wire is tracked so
+// ScoreVoiceDeepfake can refuse instead.
 type DeepfakeScore struct {
 	Probability float64 `json:"probability"`
 	Model       string  `json:"model,omitempty"`
+
+	// probabilityPresent records whether the wire carried `probability`.
+	probabilityPresent bool
 }
+
+// UnmarshalJSON decodes the score and records whether `probability` was
+// present. An explicit 0.0 (a real "certainly authentic") and an absent field
+// are indistinguishable by value.
+func (r *DeepfakeScore) UnmarshalJSON(data []byte) error {
+	type alias DeepfakeScore
+	var probe struct {
+		Probability *float64 `json:"probability"`
+	}
+	if err := json.Unmarshal(data, &probe); err != nil {
+		return err
+	}
+	var decoded alias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*r = DeepfakeScore(decoded)
+	r.probabilityPresent = probe.Probability != nil
+	return nil
+}
+
+// HasVerdict reports whether the backend actually returned a probability.
+func (r *DeepfakeScore) HasVerdict() bool { return r != nil && r.probabilityPresent }
 
 type voiceBody struct {
 	ProjectID   string `json:"projectId"`
@@ -3264,6 +3786,10 @@ func (c *Client) ScoreVoiceDeepfake(ctx context.Context, projectID, audioBase64 
 	body := voiceBody{ProjectID: projectID, AudioBase64: audioBase64}
 	if err := c.doRequest(ctx, http.MethodPost, "/voice/deepfake-score", body, &result); err != nil {
 		return nil, fmt.Errorf("ScoreVoiceDeepfake: %w", err)
+	}
+	if !result.HasVerdict() {
+		return nil, indeterminateVerdict("ScoreVoiceDeepfake", "probability",
+			"POST /voice/deepfake-score")
 	}
 	return &result, nil
 }
@@ -3351,12 +3877,306 @@ type RAGInjectionDocument struct {
 }
 
 // RAGInjectionScanResult is the outcome of ScanRAGInjection.
+//
+// Same CLASS-1 hazard as the firewall response: `Clean` zero-values to false
+// and `PoisonedIndices` to nil. A caller that keeps every document NOT named in
+// PoisonedIndices — the natural filtering idiom — therefore forwarded the whole
+// retrieved set to the model when the scan result never arrived. Presence of
+// `clean` on the wire is tracked so ScanRAGInjection can refuse.
 type RAGInjectionScanResult struct {
 	Scanned         int              `json:"scanned"`
 	Clean           bool             `json:"clean"`
 	PoisonedCount   int              `json:"poisonedCount"`
 	PoisonedIndices []int            `json:"poisonedIndices"`
 	Violations      []map[string]any `json:"violations"`
+
+	// cleanPresent records whether the wire carried a boolean `clean`.
+	cleanPresent bool
+}
+
+// UnmarshalJSON decodes the result and records whether `clean` was present.
+// See FirewallCheckResponse.UnmarshalJSON for why the alias indirection is
+// required and why presence cannot be inferred from the value.
+func (r *RAGInjectionScanResult) UnmarshalJSON(data []byte) error {
+	type alias RAGInjectionScanResult
+	var probe struct {
+		Clean *bool `json:"clean"`
+	}
+	if err := json.Unmarshal(data, &probe); err != nil {
+		return err
+	}
+	var decoded alias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*r = RAGInjectionScanResult(decoded)
+	r.cleanPresent = probe.Clean != nil
+	return nil
+}
+
+// ragSeverityRank is the CLOSED severity ladder the chunk scanner ranks against
+// (packages/core/src/gateway/rag-injector.ts `SEV_RANK`), and `minSeverity` on
+// the route is the same four-value enum. A severity outside it cannot be ranked,
+// so a violation carrying one cannot be compared to the acting threshold — that
+// is drift, and the scan is refused rather than silently ignored.
+var ragSeverityRank = map[string]int{"low": 0, "medium": 1, "high": 2, "critical": 3}
+
+// ragDefaultMinSeverity mirrors the route's server-side default
+// (`scanChunksForInjection(docs, { minSeverity: b.minSeverity })` →
+// `opts.minSeverity ?? "high"`), applied when the caller passes "".
+const ragDefaultMinSeverity = "high"
+
+// ragScanBinding ties a decoded result back to the REQUEST that produced it.
+// Nothing on the wire can restate these: docCount is what the CALLER submitted
+// and minSeverity is what the CALLER asked for, so a rewritten body cannot move
+// the goalposts by editing a field.
+type ragScanBinding struct {
+	// docCount is the number of documents submitted; -1 when unknown (decoding
+	// a stored report, where there is no request to bind to).
+	docCount int
+	// minSeverity is the threshold the caller requested ("" → the route
+	// default). When it is not a rankable severity the threshold is treated as
+	// UNKNOWN and the weaker, threshold-free feasibility rule is used instead.
+	minSeverity string
+}
+
+// HasVerdict reports whether the scan returned a verdict the caller can ACT ON.
+//
+// That is presence AND self-consistency, because for this result type the two
+// are the same safety property. `Clean=false` with an empty `PoisonedIndices`
+// LOOKS fail-closed — the scan is reporting poison — while the consequence is
+// fail-open: the filtering idiom this SDK documents ("keep every document not
+// named as poisoned", CHANGELOG 1.5.0) names nothing to drop and forwards the
+// ENTIRE retrieved set to the model. A scan that says unsafe but cannot say
+// WHICH documents is INDETERMINATE, not a verdict.
+func (r *RAGInjectionScanResult) HasVerdict() bool {
+	return r != nil && r.cleanPresent && r.inconsistency(ragScanBinding{docCount: -1}) == ""
+}
+
+// violationEvidence is the incrimination the report makes about itself: for each
+// document index, the HIGHEST severity rank among the violations the body lists
+// against it. Absent from the map ⇒ the report names no violation for that
+// document at all.
+//
+// It returns a reason string when a violation cannot be read as evidence.
+// `flagged` entries are emitted by the backend with BOTH `chunkIndex` and
+// `severity` on every element (rag-injector.ts pushes a fully populated
+// ChunkScanViolation), so a violation missing either one is not a violation this
+// client can weigh — and an unweighable violation is exactly how a rewritten
+// body would hide a poisoned document from the coverage rule below.
+func (r *RAGInjectionScanResult) violationEvidence(bound int) (map[int]int, string) {
+	evidence := make(map[int]int, len(r.Violations))
+	for n, v := range r.Violations {
+		if v == nil {
+			return nil, fmt.Sprintf("`violations[%d]` is null and names no document", n)
+		}
+		raw, ok := v["chunkIndex"]
+		if !ok {
+			return nil, fmt.Sprintf("`violations[%d]` carries no `chunkIndex`, so the violation "+
+				"cannot be attributed to a document", n)
+		}
+		f, ok := raw.(float64)
+		if !ok || f != math.Trunc(f) {
+			return nil, fmt.Sprintf("`violations[%d].chunkIndex` is %v, not a document index", n, raw)
+		}
+		idx := int(f)
+		if idx < 0 || idx >= bound {
+			return nil, fmt.Sprintf("`violations[%d].chunkIndex` is %d but only %d document(s) were "+
+				"scanned — the violation does not point at a document the caller can drop", n, idx, bound)
+		}
+		sev, _ := v["severity"].(string)
+		rank, ok := ragSeverityRank[sev]
+		if !ok {
+			return nil, fmt.Sprintf("`violations[%d].severity` is %s, outside "+
+				"critical/high/medium/low, so it cannot be compared to `minSeverity`", n, quoteVerdict(sev))
+		}
+		if cur, seen := evidence[idx]; !seen || rank > cur {
+			evidence[idx] = rank
+		}
+	}
+	return evidence, ""
+}
+
+// inconsistency describes why the result contradicts itself or the request that
+// produced it, or "" when it is coherent.
+//
+// AUDIT 2026-08-03 ROUND 2 — this was a CARDINALITY check standing in for an
+// IDENTITY check. `poisonedCount == len(poisonedIndices)` is satisfied by
+// `{"poisonedCount":2,"poisonedIndices":[0,0]}`, which identifies ONE document
+// while claiming two, and by `[1,4]` when the poisoned documents were 1 and 3 —
+// same count, same range, DIFFERENT SET. Either way the documented filter
+// forwards an attack document. A count that agrees with a length says nothing
+// about WHICH documents were identified, so the check now validates the SET:
+// canonical (unique, ascending, in range), bound to the submitted input, and
+// equal to the set the report's OWN violations incriminate.
+//
+// Every rule mirrors an invariant the backend GUARANTEES, so no response a
+// healthy server can produce is rejected (that is the over-block control).
+// packages/core/src/gateway/rag-injector.ts builds `poisoned` as a Set and
+// returns `[...poisoned].sort((a,b) => a-b)` over chunk indices of the submitted
+// set, adding i for every violation whose rank ≥ minSeverity; the route
+// (apps/web/src/app/api/v1/security/rag-injection-scan/route.ts) sets
+// `scanned: documents.length`, `poisonedCount: poisonedIndices.length` and
+// `violations: flagged`. Therefore:
+//
+//	scanned == len(documents)                      (coverage)
+//	indices unique + strictly ascending + < scanned (canonical set)
+//	clean ⟺ len(indices) == 0                      (agreement)
+//	poisonedCount == len(indices)                  (cardinality, still)
+//	{i : maxViolationRank(i) ≥ minSeverity} == set(indices)   (identity)
+//
+// A body violating any of them is drift, a proxy envelope, a replayed scan of a
+// different input, or a rewritten payload — never a real verdict.
+func (r *RAGInjectionScanResult) inconsistency(b ragScanBinding) string {
+	if r == nil {
+		return "nil result"
+	}
+	if !r.cleanPresent {
+		// Absence is reported separately, with its own message.
+		return ""
+	}
+
+	// ── COVERAGE ────────────────────────────────────────────────────────────
+	// `scanned` is the backend restating how many documents it actually looked
+	// at. Checked FIRST and unconditionally: a verdict about 3 of 5 documents
+	// is not a verdict about the retrieved set, however self-consistent the
+	// rest of the body is. This also catches an absent `scanned` (0 ≠ n) and a
+	// genuine scan of a truncated input replayed against the full request.
+	if b.docCount >= 0 {
+		if r.Scanned != b.docCount {
+			return fmt.Sprintf("`scanned` is %d but %d document(s) were submitted — "+
+				"%d document(s) were never examined and the scan says nothing about them",
+				r.Scanned, b.docCount, b.docCount-r.Scanned)
+		}
+	} else if r.Scanned < 1 {
+		return "`scanned` is 0 — the report covers no document"
+	}
+
+	// ── CANONICAL SET ───────────────────────────────────────────────────────
+	// A Set serialized through sort() is unique and strictly ascending. A
+	// repeated index inflates the count without naming a second document; a
+	// descending pair is a rewritten array.
+	named := make(map[int]bool, len(r.PoisonedIndices))
+	prev := -1
+	for _, i := range r.PoisonedIndices {
+		if i < 0 || i >= r.Scanned {
+			return fmt.Sprintf("`poisonedIndices` names document %d but only %d were scanned — "+
+				"the index does not identify a document the caller can drop", i, r.Scanned)
+		}
+		if named[i] {
+			return fmt.Sprintf("`poisonedIndices` %v repeats document %d — it names %d distinct "+
+				"document(s) while claiming %d, so %d poisoned document(s) are unidentified and "+
+				"WOULD BE FORWARDED", r.PoisonedIndices, i, len(named), r.PoisonedCount,
+				r.PoisonedCount-len(named))
+		}
+		if i <= prev {
+			return fmt.Sprintf("`poisonedIndices` %v is not ascending — the backend serializes a "+
+				"sorted Set, so this array was rewritten in transit", r.PoisonedIndices)
+		}
+		named[i] = true
+		prev = i
+	}
+
+	// ── AGREEMENT ───────────────────────────────────────────────────────────
+	if !r.Clean && len(named) == 0 {
+		return fmt.Sprintf("`clean` is false (poison REPORTED) but `poisonedIndices` names no document "+
+			"(poisonedCount=%d) — the scan cannot say WHICH documents to drop", r.PoisonedCount)
+	}
+	if r.Clean && len(named) > 0 {
+		return fmt.Sprintf("`clean` is true but `poisonedIndices` names %d document(s) %v",
+			len(named), r.PoisonedIndices)
+	}
+	if r.PoisonedCount != len(r.PoisonedIndices) {
+		return fmt.Sprintf("`poisonedCount` is %d but `poisonedIndices` names %d document(s) — "+
+			"%d poisoned document(s) are unattributed", r.PoisonedCount, len(r.PoisonedIndices),
+			r.PoisonedCount-len(r.PoisonedIndices))
+	}
+
+	// ── IDENTITY ────────────────────────────────────────────────────────────
+	// The drop-list must be exactly the set of documents the report's own
+	// violations incriminate at the acting threshold. This is the only check
+	// that ties the indices to WHICH documents are poisoned rather than HOW
+	// MANY, and it is evaluated unconditionally: deleting `violations` does not
+	// disable it, it makes a non-clean result unevidenced and therefore refused.
+	evidence, why := r.violationEvidence(r.Scanned)
+	if why != "" {
+		return why
+	}
+	if t, ok := ragSeverityRank[b.minSeverity]; ok || b.minSeverity == "" {
+		if b.minSeverity == "" {
+			t = ragSeverityRank[ragDefaultMinSeverity]
+		}
+		return ragIdentityMismatch(named, evidence, t, r.PoisonedIndices)
+	}
+	// The threshold is unknown (a stored report, or a minSeverity this client
+	// cannot rank). Fall back to the threshold-FREE form of the same rule: some
+	// threshold in the enum must reproduce this exact drop-list from this exact
+	// evidence. It still rejects a named document with no violation at all and
+	// an unnamed document carrying a critical one.
+	return ragIdentityFeasible(named, evidence, r.PoisonedIndices)
+}
+
+// ragIdentityMismatch compares the claimed drop-list against the documents the
+// violations incriminate at threshold t.
+func ragIdentityMismatch(named map[int]bool, evidence map[int]int, t int, indices []int) string {
+	for i := range named {
+		rank, ok := evidence[i]
+		if !ok {
+			return fmt.Sprintf("`poisonedIndices` %v names document %d, but `violations` records "+
+				"nothing against it — the drop-list does not match the evidence in the same body", indices, i)
+		}
+		if rank < t {
+			return fmt.Sprintf("`poisonedIndices` names document %d whose worst violation is below "+
+				"the requested minSeverity — the drop-list does not match the evidence", i)
+		}
+	}
+	for i, rank := range evidence {
+		if rank >= t && !named[i] {
+			return fmt.Sprintf("`violations` records a %s-or-worse payload in document %d but "+
+				"`poisonedIndices` %v does not name it — that document WOULD BE FORWARDED to the model",
+				ragSeverityName(t), i, indices)
+		}
+	}
+	return ""
+}
+
+// ragIdentityFeasible is the threshold-free form: it asks whether ANY severity
+// in the enum could have produced this drop-list from this evidence.
+func ragIdentityFeasible(named map[int]bool, evidence map[int]int, indices []int) string {
+	lo := len(ragSeverityRank) - 1 // highest rank a threshold may take ("critical")
+	for i := range named {
+		rank, ok := evidence[i]
+		if !ok {
+			return fmt.Sprintf("`poisonedIndices` %v names document %d, but `violations` records "+
+				"nothing against it — the drop-list does not match the evidence in the same body", indices, i)
+		}
+		if rank < lo {
+			lo = rank
+		}
+	}
+	hi := -1
+	for i, rank := range evidence {
+		if !named[i] && rank > hi {
+			hi = rank
+		}
+	}
+	if hi >= lo {
+		return fmt.Sprintf("no minSeverity explains `poisonedIndices` %v: an unnamed document carries "+
+			"a %s payload while a named one carries only %s — that document WOULD BE FORWARDED",
+			indices, ragSeverityName(hi), ragSeverityName(lo))
+	}
+	return ""
+}
+
+// ragSeverityName renders a rank back to its severity label for an operator
+// message.
+func ragSeverityName(rank int) string {
+	for name, r := range ragSeverityRank {
+		if r == rank {
+			return name
+		}
+	}
+	return fmt.Sprintf("rank-%d", rank)
 }
 
 type scanRAGInjectionBody struct {
@@ -3379,6 +4199,20 @@ func (c *Client) ScanRAGInjection(ctx context.Context, projectID string, documen
 	body := scanRAGInjectionBody{ProjectID: projectID, Documents: documents, MinSeverity: minSeverity}
 	if err := c.doRequest(ctx, http.MethodPost, "/security/rag-injection-scan", body, &result); err != nil {
 		return nil, fmt.Errorf("ScanRAGInjection: %w", err)
+	}
+	if !result.cleanPresent {
+		return nil, indeterminateVerdict("ScanRAGInjection", "clean",
+			"POST /security/rag-injection-scan")
+	}
+	// The result is validated against the REQUEST — how many documents were
+	// submitted and at what threshold — because only the caller side knows
+	// those. A response can restate neither, so it cannot move the goalposts:
+	// an index the caller cannot map back to a submitted document is as useless
+	// as no index at all, and a scan that covered fewer documents than were
+	// submitted is not a verdict about the retrieved set.
+	if reason := result.inconsistency(ragScanBinding{docCount: len(documents), minSeverity: minSeverity}); reason != "" {
+		return nil, uninterpretableVerdict("ScanRAGInjection",
+			"POST /security/rag-injection-scan", reason)
 	}
 	return &result, nil
 }
@@ -3494,12 +4328,144 @@ type McpAuditFinding struct {
 }
 
 // McpAuditReport is the severity-tiered result of a pre-deploy MCP server audit.
+//
+// Verdict is one of "block", "review", "pass" (route.ts). The zero value is the
+// empty string, which is none of them — so a 200 carrying no verdict used to
+// satisfy the natural gate `if report.Verdict == "block" { refuse }` and DEPLOY
+// the server. AuditMcpServer now refuses instead; HasVerdict exposes the same
+// check to anyone decoding a stored report themselves.
 type McpAuditReport struct {
 	Verdict   string            `json:"verdict"`
 	RiskScore int               `json:"riskScore"`
 	ToolCount int               `json:"toolCount"`
 	Summary   map[string]int    `json:"summary"`
 	Findings  []McpAuditFinding `json:"findings"`
+}
+
+// mcpAuditVerdicts is the CLOSED set of deploy verdicts the audit emits
+// (packages/core/src/mcp-predeployment/index.ts:
+// `verdict: "block" | "review" | "pass"`).
+//
+// Matched EXACTLY — no case folding, no trimming. The backend emits these three
+// lowercase literals and nothing else, so "PASS" or "Block" on the wire is not a
+// stylistic variation, it is evidence something between the auditor and this
+// client rewrote the body. Folding "PASS" back to "pass" would DEPLOY on exactly
+// that evidence; refusing costs a healthy server nothing because it never sends
+// it. This is the allowlist rule the Python SDK adopted for firewall actions
+// (evalguard/guardrails.py `_ALLOW_ACTIONS`): a verdict this client version does
+// not recognise — a newer, stricter state such as "quarantine" — must DENY. An
+// old client meeting a new restrictive verdict must not wave it through, and if
+// the new verdict is actually a looser one the failure is VISIBLE (a blocked
+// deploy) rather than silent.
+var mcpAuditVerdicts = map[string]bool{"block": true, "review": true, "pass": true}
+
+// mcpAuditSeverityWeight is the risk weighting the auditor applies
+// (packages/core/src/mcp-predeployment/index.ts `SEVERITY_WEIGHT`), and its keys
+// are the closed severity set a finding may carry.
+var mcpAuditSeverityWeight = map[string]int{"critical": 40, "high": 20, "medium": 8, "low": 2}
+
+// HasVerdict reports whether the audit returned a deploy verdict this client
+// can ACT ON — i.e. one of block/review/pass, backed by the evidence in the
+// same report.
+//
+// AUDIT 2026-08-03: this was `r.Verdict != ""`, a PRESENCE check standing in for
+// a VALIDITY check. Any non-empty string satisfied it, so the natural gate
+// `if report.Verdict == "block" { refuse }` deployed a server whose verdict was
+// "Block", "quarantine", or "upstream timeout" — including one the audit had
+// just scored 98/100.
+//
+// ROUND 2: validity against the closed set was still a check on a PROXY. The
+// verdict is DERIVED — `summary.critical > 0 ? "block" : summary.high +
+// summary.medium > 0 ? "review" : "pass"` — so flipping the one word "block" to
+// "pass" on a report that still carries a critical finding was a valid verdict,
+// and the deploy gate opened. HasVerdict now requires the verdict to agree with
+// the findings and summary the report hands you.
+//
+// Consequence, deliberately: a report stripped down to `{"verdict":"block"}`
+// has no verdict, because the auditor never emits a verdict without a summary.
+// The asymmetry is the point — evidence-stripping can only ever turn a verdict
+// into a refusal, never into a deploy.
+func (r *McpAuditReport) HasVerdict() bool {
+	return r != nil && mcpAuditVerdicts[r.Verdict] && r.inconsistency(-1) == ""
+}
+
+// inconsistency describes why the audit report contradicts itself or the request
+// that produced it, or "" when it is coherent. toolCount is the number of tools
+// submitted; pass -1 when unknown (decoding a stored report).
+//
+// Mirrors auditMcpServerConfig() exactly, so nothing a healthy auditor emits is
+// rejected: `summary` tallies findings by severity with `total: findings.length`,
+// `riskScore = min(100, Σ SEVERITY_WEIGHT[severity])`, `toolCount = tools.length`
+// and the verdict is derived from the summary.
+func (r *McpAuditReport) inconsistency(toolCount int) string {
+	if r == nil {
+		return "nil report"
+	}
+	if !mcpAuditVerdicts[r.Verdict] {
+		return fmt.Sprintf("`verdict` is %s, which is not one of block/review/pass", quoteVerdict(r.Verdict))
+	}
+
+	// COVERAGE — an audit of 1 of the 3 tools you submitted is not an audit of
+	// the server you are about to deploy.
+	if toolCount >= 0 && r.ToolCount != toolCount {
+		return fmt.Sprintf("`toolCount` is %d but %d tool(s) were submitted — the report does not "+
+			"cover the server this caller asked about", r.ToolCount, toolCount)
+	}
+
+	// EVIDENCE — the auditor always emits a full summary alongside the verdict.
+	// Requiring it is what stops a rewritten body from deleting the evidence to
+	// escape the derivation check below.
+	if r.Summary == nil {
+		return "`summary` is absent — the report carries a verdict with no severity tally to justify it"
+	}
+	tally := map[string]int{}
+	for n, f := range r.Findings {
+		if _, ok := mcpAuditSeverityWeight[f.Severity]; !ok {
+			return fmt.Sprintf("`findings[%d].severity` is %s, outside critical/high/medium/low",
+				n, quoteVerdict(f.Severity))
+		}
+		tally[f.Severity]++
+	}
+	for sev := range mcpAuditSeverityWeight {
+		got, ok := r.Summary[sev]
+		if !ok {
+			return fmt.Sprintf("`summary` has no %q count — the tally is incomplete", sev)
+		}
+		if got != tally[sev] {
+			return fmt.Sprintf("`summary.%s` is %d but `findings` carries %d — the tally does not "+
+				"match the evidence in the same report", sev, got, tally[sev])
+		}
+	}
+	if total, ok := r.Summary["total"]; !ok || total != len(r.Findings) {
+		return fmt.Sprintf("`summary.total` is %d but `findings` carries %d", r.Summary["total"], len(r.Findings))
+	}
+
+	// The two numbers a deploy gate actually reads are both DERIVED, so both are
+	// recomputed from the findings rather than trusted.
+	score := 0
+	for _, f := range r.Findings {
+		score += mcpAuditSeverityWeight[f.Severity]
+	}
+	if score > 100 {
+		score = 100
+	}
+	if r.RiskScore != score {
+		return fmt.Sprintf("`riskScore` is %d but the findings weigh %d — a `riskScore` deploy "+
+			"threshold would be read against a number the report did not earn", r.RiskScore, score)
+	}
+	want := "pass"
+	switch {
+	case r.Summary["critical"] > 0:
+		want = "block"
+	case r.Summary["high"]+r.Summary["medium"] > 0:
+		want = "review"
+	}
+	if r.Verdict != want {
+		return fmt.Sprintf("`verdict` is %q but %d critical / %d high / %d medium finding(s) derive %q — "+
+			"the deploy gate would read a verdict the evidence contradicts",
+			r.Verdict, r.Summary["critical"], r.Summary["high"], r.Summary["medium"], want)
+	}
+	return ""
 }
 
 type mcpAuditBody struct {
@@ -3525,16 +4491,108 @@ func (c *Client) AuditMcpServer(ctx context.Context, projectID string, server ma
 	if err := c.doRequest(ctx, http.MethodPost, "/security/mcp-predeployment-audit", body, &result); err != nil {
 		return nil, fmt.Errorf("AuditMcpServer: %w", err)
 	}
+	if result.Verdict == "" {
+		return nil, indeterminateVerdict("AuditMcpServer", "verdict",
+			"POST /security/mcp-predeployment-audit")
+	}
+	// Bound to the REQUEST: len(tools) is what this caller submitted, so a
+	// report that audited fewer cannot pass by restating its own coverage.
+	if reason := result.inconsistency(len(tools)); reason != "" {
+		return nil, uninterpretableVerdict("AuditMcpServer", "POST /security/mcp-predeployment-audit", reason)
+	}
 	return &result, nil
 }
 
 // AgentExecRedTeamResult is the breach verdict from an execution-layer red-team.
+//
+// Every numeric field zero-values to 0 and Verdict to "", so a 200 that is not
+// a red-team result reads as "0 attacks, 0 breaches, no verdict" — a clean bill
+// of health for a run that never happened. RunAgentExecRedTeam refuses instead.
 type AgentExecRedTeamResult struct {
 	TotalAttacks      int      `json:"totalAttacks"`
 	DangerousAttempts int      `json:"dangerousAttempts"`
 	Breaches          int      `json:"breaches"`
 	Verdict           string   `json:"verdict"`
 	Tools             []string `json:"tools"`
+}
+
+// agentExecVerdicts is the CLOSED set of red-team verdicts
+// (packages/core/src/agent-exec-redteam/index.ts:
+// `verdict: "breached" | "attempted" | "safe"`). Matched exactly, same rule and
+// same reasoning as mcpAuditVerdicts.
+var agentExecVerdicts = map[string]bool{"breached": true, "attempted": true, "safe": true}
+
+// HasVerdict reports whether the red-team run returned a verdict this client
+// can ACT ON — i.e. one of breached/attempted/safe, backed by the counts in the
+// same result.
+//
+// AUDIT 2026-08-03: fixed alongside McpAuditReport.HasVerdict, which had the
+// identical `!= ""` presence-for-validity defect. Leaving this one would have
+// kept the same fail-open alive under a different field name: the natural gate
+// `if res.Verdict == "breached" { fail the build }` reads "not breached" for
+// "Breached", "BREACHED", or any verdict a newer server introduces.
+//
+// ROUND 2: this verdict is DERIVED too — `breaches > 0 ? "breached" :
+// dangerousAttempts > 0 ? "attempted" : "safe"` — so the same one-word edit that
+// turned an MCP "block" into "pass" turns "breached" into "safe" on a result
+// still reporting breaches. Validity against the closed set does not see it;
+// re-deriving from the counts does.
+func (r *AgentExecRedTeamResult) HasVerdict() bool {
+	return r != nil && agentExecVerdicts[r.Verdict] && r.inconsistency(-1) == ""
+}
+
+// inconsistency describes why the red-team result contradicts itself or the
+// request that produced it, or "" when it is coherent. promptCount is the number
+// of attack prompts the caller supplied; pass -1 (or 0, meaning "server's default
+// set") when there is nothing to bind to.
+//
+// Mirrors runAgentExecRedTeam() exactly: `attacks` is one entry per prompt,
+// `dangerousAttempts` and `breaches` are FILTERS of that same slice — so a
+// breach is always also a dangerous attempt — and the verdict is derived from
+// the two counts.
+func (r *AgentExecRedTeamResult) inconsistency(promptCount int) string {
+	if r == nil {
+		return "nil result"
+	}
+	if !agentExecVerdicts[r.Verdict] {
+		return fmt.Sprintf("`verdict` is %s, which is not one of breached/attempted/safe",
+			quoteVerdict(r.Verdict))
+	}
+	// COVERAGE — "0 attacks, 0 breaches, safe" is a clean bill of health for a
+	// run that never happened.
+	if r.TotalAttacks < 1 {
+		return "`totalAttacks` is 0 — no attack was run, so `verdict` reports on nothing"
+	}
+	if promptCount > 0 && r.TotalAttacks != promptCount {
+		return fmt.Sprintf("`totalAttacks` is %d but %d attack prompt(s) were submitted — %d attack(s) "+
+			"were never run", r.TotalAttacks, promptCount, promptCount-r.TotalAttacks)
+	}
+	if r.Breaches < 0 || r.DangerousAttempts < 0 {
+		return fmt.Sprintf("negative counts (breaches=%d, dangerousAttempts=%d)", r.Breaches, r.DangerousAttempts)
+	}
+	// Every breached attack is by construction also an attempted one, and both
+	// are subsets of the attacks that ran.
+	if r.Breaches > r.DangerousAttempts {
+		return fmt.Sprintf("`breaches` is %d but `dangerousAttempts` is only %d — every breach is a "+
+			"dangerous attempt, so these counts cannot both be true", r.Breaches, r.DangerousAttempts)
+	}
+	if r.DangerousAttempts > r.TotalAttacks {
+		return fmt.Sprintf("`dangerousAttempts` is %d but only %d attack(s) ran",
+			r.DangerousAttempts, r.TotalAttacks)
+	}
+	want := "safe"
+	switch {
+	case r.Breaches > 0:
+		want = "breached"
+	case r.DangerousAttempts > 0:
+		want = "attempted"
+	}
+	if r.Verdict != want {
+		return fmt.Sprintf("`verdict` is %q but %d breach(es) / %d dangerous attempt(s) derive %q — "+
+			"a build gate would read a verdict the counts contradict",
+			r.Verdict, r.Breaches, r.DangerousAttempts, want)
+	}
+	return ""
 }
 
 type agentExecBody struct {
@@ -3557,6 +4615,15 @@ func (c *Client) RunAgentExecRedTeam(ctx context.Context, projectID, provider, m
 	body := agentExecBody{ProjectID: projectID, TargetProvider: provider, TargetModel: model, AttackPrompts: attackPrompts}
 	if err := c.doRequest(ctx, http.MethodPost, "/security/agent-exec-redteam", body, &result); err != nil {
 		return nil, fmt.Errorf("RunAgentExecRedTeam: %w", err)
+	}
+	if result.Verdict == "" {
+		return nil, indeterminateVerdict("RunAgentExecRedTeam", "verdict",
+			"POST /security/agent-exec-redteam")
+	}
+	// Bound to the REQUEST: when this caller supplied the attack prompts, the
+	// run must have executed exactly that many.
+	if reason := result.inconsistency(len(attackPrompts)); reason != "" {
+		return nil, uninterpretableVerdict("RunAgentExecRedTeam", "POST /security/agent-exec-redteam", reason)
 	}
 	return &result, nil
 }
@@ -3629,13 +4696,21 @@ func isUnsafeMethod(method string) bool {
 	}
 }
 
-func (c *Client) doRequest(ctx context.Context, method, path string, body any, target any) error {
+// doRaw is the single place this client speaks HTTP. It runs the shared
+// retry/backoff loop (transient 429/5xx retried with Retry-After honored, one
+// stable Idempotency-Key reused across attempts of an unsafe method) and, on
+// success, returns the raw response body and headers. Both doRequest (enveloped
+// JSON) and FetchTraceAttachment (binary download) build on it, so every method
+// shares one retry path and one typed *EvalGuardError surface. accept sets the
+// Accept header ("application/json" for JSON routes, "application/octet-stream"
+// for binary downloads).
+func (c *Client) doRaw(ctx context.Context, method, path, accept string, body any) ([]byte, http.Header, error) {
 	var bodyData []byte
 	if body != nil {
 		var err error
 		bodyData, err = json.Marshal(body)
 		if err != nil {
-			return &EvalGuardError{Code: ErrCodeValidation, Message: fmt.Sprintf("failed to marshal request body: %v", err)}
+			return nil, nil, &EvalGuardError{Code: ErrCodeValidation, Message: fmt.Sprintf("failed to marshal request body: %v", err)}
 		}
 	}
 
@@ -3651,14 +4726,19 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body any, t
 	var lastErr error
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		if attempt > 0 {
-			// Wait before retrying. For 429, use Retry-After; otherwise exponential backoff.
+			// Wait before retrying. For 429 the server's Retry-After hint is
+			// honoured but CLAMPED to maxRetryDelay — a hint may shorten a wait,
+			// never extend it past the ceiling. Every branch is jittered so a
+			// fleet that rate-limits together does not retry in lockstep and
+			// re-stampede the recovering origin.
 			delay := baseRetryDelay * time.Duration(math.Pow(2, float64(attempt-1)))
 			if rateLimitErr, ok := lastErr.(*RateLimitError); ok {
 				delay = rateLimitErr.RetryAfter
 			}
+			delay = jitteredDelay(delay)
 			select {
 			case <-ctx.Done():
-				return &EvalGuardError{Code: ErrCodeTimeout, Message: "request cancelled while waiting to retry"}
+				return nil, nil, &EvalGuardError{Code: ErrCodeTimeout, Message: "request cancelled while waiting to retry"}
 			case <-time.After(delay):
 			}
 		}
@@ -3670,12 +4750,12 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body any, t
 
 		req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, bodyReader)
 		if err != nil {
-			return &EvalGuardError{Code: ErrCodeNetworkFailure, Message: fmt.Sprintf("failed to create request: %v", err)}
+			return nil, nil, &EvalGuardError{Code: ErrCodeNetworkFailure, Message: fmt.Sprintf("failed to create request: %v", err)}
 		}
 
 		req.Header.Set("Authorization", "Bearer "+c.apiKey)
 		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Accept", "application/json")
+		req.Header.Set("Accept", accept)
 		req.Header.Set("User-Agent", userAgent)
 		req.Header.Set("x-evalguard-client-version", clientVersion)
 		if idempotencyKey != "" {
@@ -3686,7 +4766,7 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body any, t
 		resp, err := c.httpClient.Do(req)
 		if err != nil {
 			if ctx.Err() == context.DeadlineExceeded {
-				return &EvalGuardError{Code: ErrCodeTimeout, Message: "request timed out"}
+				return nil, nil, &EvalGuardError{Code: ErrCodeTimeout, Message: "request timed out"}
 			}
 			lastErr = &EvalGuardError{Code: ErrCodeNetworkFailure, Message: fmt.Sprintf("request failed: %v", err)}
 			continue
@@ -3699,30 +4779,38 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body any, t
 			continue
 		}
 
-		requestID := resp.Header.Get("X-Request-ID")
-
 		if resp.StatusCode >= 400 {
+			requestID := resp.Header.Get("X-Request-ID")
 			lastErr = c.handleErrorResponse(resp, respBody, requestID)
 			// Retry on 429 (rate limit) and 5xx (server errors)
 			if resp.StatusCode == 429 || resp.StatusCode >= 500 {
 				continue
 			}
 			// Non-retryable client errors (401, 403, 404, 422, etc.)
-			return lastErr
+			return nil, nil, lastErr
 		}
 
-		if target != nil && len(respBody) > 0 {
-			if err := unmarshalEnvelope(respBody, target); err != nil {
-				return &EvalGuardError{
-					Code:      ErrCodeInternal,
-					Message:   fmt.Sprintf("failed to decode response: %v", err),
-					RequestID: requestID,
-				}
+		return respBody, resp.Header, nil
+	}
+	return nil, nil, lastErr
+}
+
+func (c *Client) doRequest(ctx context.Context, method, path string, body any, target any) error {
+	respBody, header, err := c.doRaw(ctx, method, path, "application/json", body)
+	if err != nil {
+		return err
+	}
+
+	if target != nil && len(respBody) > 0 {
+		if err := unmarshalEnvelope(respBody, target); err != nil {
+			return &EvalGuardError{
+				Code:      ErrCodeInternal,
+				Message:   fmt.Sprintf("failed to decode response: %v", err),
+				RequestID: header.Get("X-Request-ID"),
 			}
 		}
-		return nil
 	}
-	return lastErr
+	return nil
 }
 
 // unmarshalEnvelope decodes the standard EvalGuard API response envelope
@@ -3798,12 +4886,20 @@ func (c *Client) handleErrorResponse(resp *http.Response, body []byte, requestID
 		return &base
 	case statusCode == 429:
 		base.Code = ErrCodeRateLimit
-		retryAfter := 60 * time.Second
+		// Bounded, never verbatim — see maxRetryDelay.
+		retryAfter := retryAfterFallback
 		if ra := resp.Header.Get("Retry-After"); ra != "" {
-			if seconds, parseErr := strconv.Atoi(ra); parseErr == nil && seconds > 0 {
+			if seconds, parseErr := strconv.Atoi(strings.TrimSpace(ra)); parseErr == nil && seconds > 0 {
 				retryAfter = time.Duration(seconds) * time.Second
+			} else if at, dateErr := http.ParseTime(strings.TrimSpace(ra)); dateErr == nil {
+				// HTTP-date form (RFC 9110 10.2.3): Atoi returns an error here,
+				// so the hint used to be dropped on the floor.
+				if d := time.Until(at); d > 0 {
+					retryAfter = d
+				}
 			}
 		}
+		retryAfter = clampRetryDelay(retryAfter)
 		return &RateLimitError{EvalGuardError: base, RetryAfter: retryAfter}
 	default:
 		// Every status the switch doesn't name explicitly used to collapse to
