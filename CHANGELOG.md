@@ -7,6 +7,151 @@ tag automatically (see `RELEASE.md`). Keep the `clientVersion` constant in
 `evalguard.go` — sent as `x-evalguard-client-version` on every request — in
 lockstep with the release tag.
 
+## 1.6.0 — 2026-08-07
+
+**Security — `1.5.0` closed seven of the fail-open methods. This closes the
+other thirteen.** Same defect, same three outcomes (blocked, allowed, and NO
+VERDICT), reached through return types the first pass did not sweep.
+
+`1.5.0` hardened the methods returning a typed struct with a `bool`/`string`
+verdict field. The sweep behind this release went through all 158 exported
+client methods and found the class was wider in two directions:
+
+- **`map[string]any` returns — the worst shape.** The caller's gate is
+  `res["flagged"].(bool)` or `res["action"].(string) == "block"`, and a type
+  assertion on an ABSENT key yields the zero value. It does not panic the way a
+  WRONG type does, so nothing surfaced. `{}`, an empty body, `null`,
+  `{"data":null}`, an envelope with no verdict, and any unrelated HTTP 200 all
+  read as "clean image, authentic media, policy allows it, nothing leaked".
+- **Structs whose decision lives in a NESTED object or a count**, which the
+  first sweep's "does it have a bool/string verdict field" filter walked past.
+
+### Fixed — multimodal moderation
+
+- **`ModerateImage` / `ModerateVideo` / `DetectMediaDeepfake`.** `flagged` and
+  `synthetic` absent decode to `false`; `score` and `probability` absent decode
+  to `0.0`, which on a 0..1 harm scale is the MOST benign reading available.
+  Both natural gates — `if flagged { block }` and `if score > threshold { block }`
+  — therefore passed content that was never inspected. `ModerateImage`'s doc
+  comment said "Fails closed"; that described the SERVER engine
+  (`moderateImage()` returns `flagged:true` when the vision backend throws) and
+  was the exact opposite of what the Go client did. The comments now describe
+  the client.
+- The clip verdicts are re-derived from the per-frame results in the same body
+  (flagged = ANY frame, score = MAX frame, `firstFlaggedFrame`, the category
+  union, and for deepfake the mean probability), and bound to the REQUEST: how
+  many frames were submitted, at what threshold, at what sampling, and which
+  media KIND. A response can restate none of that, so it cannot move its own
+  goalposts.
+
+### Fixed — runtime enforcement, CI gates and governance
+
+- **`RunGuardrails`** — the most severe of the `map[string]any` cases. It is the
+  org-policy twin of `CheckFirewall` on the same request path and had NO
+  presence check at all: an absent `action` is `""`, which matches neither
+  `"block"` nor `"flag"`, so the text was FORWARDED. The action is now
+  re-derived from the reason severities in the same body
+  (`critical|high ⇒ block`, `any reason ⇒ flag`, else `allow`), which catches
+  the one-word edit that validity against the closed set cannot see.
+- **`ScanSecrets` / `ScanIaC` / `CodeScan`** — commit, apply and build gates.
+  `findingsCount` absent is `nil` and `findings` absent is `nil`, so
+  `if findingsCount > 0 { fail }` passed a scan that opened no file. Counts are
+  checked against the findings and the severity tally in the same body, and
+  against how many files the caller submitted. (`CodeScan` deliberately excludes
+  `info` findings from the tally check — they appear in `findings` but in no
+  `severityCounts` bucket, so a naive check would refuse healthy scans.)
+- **`LookupVulnerabilities`** — entries are 1:1 with the submitted purls IN
+  ORDER, and every summary counter is re-derived from them, so a lookup about
+  other packages or about fewer of them cannot pass as a verdict on your
+  dependency set.
+- **`ClassifyIntent`** — `intent` absent is `""` and `riskScore` absent is `0.0`,
+  the bottom of the scale. The classifier returns EARLY with `intent:"harmful"`
+  whenever `scores.harmful > 0`, so a body still scoring harm while reporting a
+  benign intent is now refused, as is a `sensitivity` below the floor the caller
+  asked for (the classifier only ever RAISES it).
+- **`IngestRAGDocuments`** — this path runs the same DLP + prompt-injection
+  screening `ScanRAGInjection` was hardened for in `1.5.0`, and it was left
+  open: `dlp` and `injection` nil read as "no secret, no PII, no injection" for
+  documents that were never screened. Both reports are now required, their
+  headline counts are checked against the per-document evidence, and a poisoned
+  index outside the submitted set is refused — the same rule the RAG scan
+  adopted.
+- **`AnalyzeShadowAI`** — three `map[string]any` fields, all nil on a 2xx that
+  was not an analysis, so every read returned "no PII, no credentials, no risk".
+  `calculateRiskScore()` is a fixed additive formula over fields the event
+  itself carries, so the score is re-derived term for term — the strongest check
+  in the release — and `inputTokens` is bound to `ceil(len(input)/4)` over the
+  text this caller actually sent.
+- **`ReportAbuse`** — `autoEscalate` and `feedToDetector` are plain bools that
+  zero-value to `false`. A CSAM or self-harm report whose triage never arrived
+  read as "not escalated, do not feed the detector" and dropped silently out of
+  the human review queue. Both flags and the dedup key are re-derived from the
+  category and subject the caller filed.
+
+### Fixed — `RunSecurityScan` returned a clean bill of health on EVERY call
+
+This one was not hypothetical, and it was not an edge case.
+
+`DEFAULT_SCAN_DEPTH` is `"full"`, only the 4-strategy `"quick"` set fits
+`SYNC_SCAN_STRATEGY_BUDGET`, and `SecurityScanRequest` **carried no `Depth`
+field** — so every call this SDK could make resolved to full depth, exceeded the
+budget, and was QUEUED. The route answers those with `202
+{id, status:"pending", mode:"async", statusUrl}` and **no score, no totalTests,
+no severityCounts, no findingsCount**. That decoded to
+`Score 0, TotalTests 0, SeverityCounts{0,0,0,0}, FindingsCount 0` with
+`err == nil`, so `if res.SeverityCounts.Critical > 0 { fail the build }` passed
+100% of the time for a scan that had not started.
+
+- `SecurityScanRequest` gains **`Depth`** (`quick`/`standard`/`full`) and
+  **`StrategyIDs`**, so an inline verdict is reachable at all.
+- `SecurityScanResult` gains **`Mode`**, **`StatusURL`**, **`ExecutedTests`**,
+  **`ErroredTests`**, and **`Queued()`**.
+- A queued scan is now REFUSED rather than returned, with the scan id and the
+  poll URL in the message so the async flow is still usable. The verdict path
+  additionally re-derives `status` from `score >= 70`.
+
+### Added
+
+- `ImageModerationResult`, `VideoModerationResult` / `VideoModerationFrame`,
+  `MediaDeepfakeResult` / `MediaDeepfakeFrame` / `DeepfakeLabelScore`,
+  `GuardrailsResult` / `GuardrailReason`, `SecretScanResult` /
+  `SecretScanFinding`, `IaCScanResult` / `IaCFinding`, `CodeScanResult` /
+  `CodeScanFinding`, `SupplyChainLookupResult` / `PurlLookupEntry` /
+  `PurlLookupSummary`, `IntentClassification`, `RAGIngestResult` /
+  `RAGDlpReport` / `RAGDlpDocumentReport` / `RAGInjectionReport` — each with
+  **`HasVerdict()`**, for a caller decoding a stored or proxied body itself.
+- `HasVerdict()` on `SecurityScanResult` and `AbuseTriage`.
+
+### Compatibility
+
+**No signature changed.** The seven `map[string]any` methods still return
+`map[string]any` — the typed structs are decoded ALONGSIDE the map from the same
+bytes and decide the refusal; the map is handed back untouched when the verdict
+is real. That is deliberate: `1.5.0` shipped as a MINOR because it changed
+BEHAVIOUR and only ADDED public API, and swapping these to typed returns would
+break every existing caller's build.
+
+The behaviour change is the same one `1.5.0` made: a 2xx the client cannot
+interpret is now `ErrCodeIndeterminate` instead of a readable zero value. Code
+already branching on `ErrCodeIndeterminate` needs no change.
+
+### Tests
+
+`media_verdict_test.go` (90 assertions) and `verdict_guards_test.go` cover every
+absent-verdict shape against a loopback listener, the explicit-allow verdicts
+that must still parse, and the one-field edit that flips a decision while
+leaving the evidence behind. Disabling the guards on the shipped surface turns
+21 tests and 164 assertions red; every "a real verdict still parses" test stays
+green.
+
+Six existing fixtures were bodies the server cannot emit and were corrected:
+guardrail reasons with no `severity` (the field `action` is derived FROM), a
+secret scan with no `scannedFiles`, an IaC scan with `findingsCount: 2` and no
+`findings`, an intent body with a `risk` field the route never had, a triage
+with `autoEscalate: true` at severity `"high"`, and a scan with
+`status: "completed"` (never emitted) carrying the 0..1 `passRate` where the
+route sends `round(passRate * 100)`.
+
 ## 1.5.0 — 2026-08-06
 
 **Security — five security decisions could be bypassed by a response that was

@@ -82,7 +82,16 @@ func TestChatCompletions_Validation(t *testing.T) {
 
 func TestRunGuardrails_PostsTextAndUnwraps(t *testing.T) {
 	var got map[string]any
-	resp := map[string]any{"data": map[string]any{"action": "block", "reasons": []map[string]any{{"type": "pii"}}}}
+	// A REAL /guardrails body. `severity` is not decoration: checkFirewall()
+	// derives `action` from it (critical|high ⇒ block), so a fixture that omits
+	// it is not a response the engine can produce — and the client now says so.
+	resp := map[string]any{"data": map[string]any{
+		"action": "block",
+		"reasons": []map[string]any{
+			{"rule": "pii-ssn", "type": "pii", "detail": "US SSN", "severity": "critical"},
+		},
+		"latencyMs": 1.42,
+	}}
 	c, cleanup := newJSONServer(t, "/guardrails", http.StatusOK, resp, &got)
 	defer cleanup()
 
@@ -110,7 +119,18 @@ func TestRunGuardrails_Validation(t *testing.T) {
 
 func TestScanSecrets_PostsContent(t *testing.T) {
 	var got map[string]any
-	resp := map[string]any{"data": map[string]any{"findingsCount": 1.0, "findings": []map[string]any{{"ruleId": "aws-access-key-id"}}}}
+	// A REAL /security/secret-scan body: the route always emits scannedFiles,
+	// filesWithFindings and the four-bucket severityCounts alongside the
+	// findings, and they must agree with each other.
+	resp := map[string]any{"data": map[string]any{
+		"scannedFiles": 1.0, "filesWithFindings": 1.0, "findingsCount": 1.0,
+		"findings": []map[string]any{{
+			"ruleId": "aws-access-key-id", "description": "AWS access key id",
+			"severity": "critical", "file": "input", "line": 3.0, "column": 11.0,
+			"redactedMatch": "AKIA****************", "matchLength": 20.0,
+		}},
+		"severityCounts": map[string]any{"critical": 1.0, "high": 0.0, "medium": 0.0, "low": 0.0},
+	}}
 	c, cleanup := newJSONServer(t, "/security/secret-scan", http.StatusOK, resp, &got)
 	defer cleanup()
 
