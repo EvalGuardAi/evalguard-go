@@ -99,7 +99,16 @@ const (
 	// public API (HasVerdict on four result types). Reusing a number that is
 	// already in the wild under different behaviour is exactly what hid the
 	// published-vs-repo drift in the Java SDK at 1.0.8.
-	clientVersion = "1.5.0"
+	//
+	// 2026-08-06: 1.5.0 -> 1.6.0. MINOR again, and for the same two reasons:
+	// thirteen more methods refuse an unreadable verdict instead of returning a
+	// zero-valued result (BEHAVIOUR), and the release is otherwise purely
+	// ADDITIVE — new result types with HasVerdict, SecurityScanRequest.Depth /
+	// StrategyIDs, SecurityScanResult.Mode / StatusURL / ExecutedTests /
+	// ErroredTests, SecurityScanResult.Queued(). No signature changed, so no
+	// consumer's build breaks. v1.5.0 is live on proxy.golang.org, so this
+	// number must not be reused.
+	clientVersion = "1.6.0"
 	// userAgent is DERIVED from clientVersion (constant string concatenation is
 	// evaluated at compile time, so this stays a plain const) so the two can
 	// never drift. A prior audit found a hardcoded "evalguard-go/1.2.0" literal
@@ -422,6 +431,22 @@ type SecurityScanRequest struct {
 	// AttackTypes is the list of attack categories to exercise, e.g.
 	// ["prompt-injection", "jailbreak"] (1..50 entries, required).
 	AttackTypes []string `json:"attackTypes"`
+	// Depth selects how many evasion STRATEGIES the scan runs: "quick" (4),
+	// "standard" (16), or "full" (every shipped strategy). Optional.
+	//
+	// AUDIT 2026-08-06 — this field did not exist, and its absence was a
+	// live fail-open. The server's DEFAULT_SCAN_DEPTH is "full", and only a set
+	// within SYNC_SCAN_STRATEGY_BUDGET (4, the "quick" set) may run inside the
+	// request; anything larger is QUEUED and answered 202 `status:"pending"`
+	// with no score and no counts. So every Go call resolved to "full", went
+	// async, and decoded to Score 0 / TotalTests 0 / SeverityCounts all-zero
+	// with err == nil — a build gate reading `SeverityCounts.Critical > 0`
+	// passed every time. Set Depth "quick" for an inline verdict; leave it empty
+	// (or "standard"/"full") and poll the queued scan by ID.
+	Depth string `json:"depth,omitempty"`
+	// StrategyIDs runs an explicit strategy set instead of a named Depth.
+	// Optional; when non-empty it wins over Depth.
+	StrategyIDs []string `json:"strategyIds,omitempty"`
 }
 
 // SecuritySeverityCounts is the per-severity finding tally returned by a scan.
@@ -432,19 +457,35 @@ type SecuritySeverityCounts struct {
 	Low      int `json:"low"`
 }
 
-// SecurityScanResult is the output of a synchronous security scan.
+// SecurityScanResult is the output of a security scan.
 //
-// POST /api/v1/security runs the scan inline and returns 201 with this
-// summary (route.ts apiSuccess at lines 400-416): the scan row id, its
-// terminal status, the aggregate safety score, the number of tests run,
-// the wall-clock duration, the per-severity counts, and the total finding
-// count. Individual findings are not inlined in this response — fetch them
-// via the scan detail endpoint by ID.
+// POST /api/v1/security answers in ONE OF TWO SHAPES, which is the fact this
+// struct hid until 2026-08-06:
+//
+//   - 201, Mode "sync": the scan ran inline. Status is "passed" or "failed",
+//     and Score / TotalTests / SeverityCounts / FindingsCount are the verdict.
+//     Reached only when the resolved strategy set fits the sync budget — i.e.
+//     Depth "quick".
+//   - 202, Mode "async": the scan was QUEUED. Status is "pending", StatusURL
+//     says where to poll, and every count field is ABSENT — so they decode to
+//     zero. This is the shape every Go call got, because the server's default
+//     depth is "full".
+//
+// Queued() and HasVerdict() separate the two. RunSecurityScan refuses the
+// queued shape outright rather than hand back an all-zero summary that reads
+// like a clean scan. Individual findings are never inlined — fetch them from
+// the scan detail endpoint by ID.
 type SecurityScanResult struct {
-	ID             string                 `json:"id"`
-	Status         string                 `json:"status"`
+	ID     string `json:"id"`
+	Status string `json:"status"`
+	// Mode is "sync" (ran inline) or "async" (queued).
+	Mode string `json:"mode,omitempty"`
+	// StatusURL is where to poll a queued scan. Set only on the async shape.
+	StatusURL      string                 `json:"statusUrl,omitempty"`
 	Score          float64                `json:"score"`
 	TotalTests     int                    `json:"totalTests"`
+	ExecutedTests  int                    `json:"executedTests"`
+	ErroredTests   int                    `json:"erroredTests"`
 	Duration       float64                `json:"duration"`
 	SeverityCounts SecuritySeverityCounts `json:"severityCounts"`
 	FindingsCount  int                    `json:"findingsCount"`
@@ -662,6 +703,33 @@ func (c *Client) RunSecurityScan(ctx context.Context, req *SecurityScanRequest) 
 	// Security scans are created at POST /security (there is no /security/scan).
 	if err := c.doRequest(ctx, http.MethodPost, "/security", req, &result); err != nil {
 		return nil, fmt.Errorf("RunSecurityScan: %w", err)
+	}
+	// Every numeric field zero-values to 0 and Status to "", so a 2xx that was
+	// not a scan read as "0 tests, 0 findings, 0 critical" — a clean red-team
+	// for a run that never happened. Structural twin of RunAgentExecRedTeam,
+	// which 1.5.0 hardened; this one was missed.
+	if result.Status == "" {
+		return nil, indeterminateVerdict("RunSecurityScan", "status", "POST /security")
+	}
+	if reason := result.inconsistency(); reason != "" {
+		return nil, uninterpretableVerdict("RunSecurityScan", "POST /security", reason)
+	}
+	// A QUEUED scan is the third outcome: not passed, not failed, no verdict
+	// yet. It is also what every Go call got before Depth existed, and its
+	// all-zero counts are indistinguishable from a clean result — so it is
+	// refused rather than returned. The id and poll URL travel in the message so
+	// nothing operational is lost.
+	if result.Queued() {
+		return nil, &EvalGuardError{
+			Code: ErrCodeIndeterminate,
+			Message: fmt.Sprintf(
+				"RunSecurityScan: the scan did not run inline — POST /security queued it as %q and "+
+					"answered 202 `status:\"pending\"` with no score and no findings, so there is NO "+
+					"verdict to read (an all-zero summary here is a scan that has not started, not a "+
+					"clean one). Poll %q for the result, or set Depth:\"quick\" to run the scan inside "+
+					"the request.",
+				result.ID, result.StatusURL),
+		}
 	}
 	return &result, nil
 }
@@ -926,10 +994,33 @@ type ShadowAIResult struct {
 }
 
 // AnalyzeShadowAI analyzes input for shadow AI risks (PII, credentials, unauthorized models).
+//
+// Fails CLOSED: all three result fields are map[string]any, which decode to NIL
+// for a 2xx that is not a shadow-AI analysis, so every natural read —
+// res.Event["riskScore"], res.PIIDetails["detected"], res.SensitiveDetails[...] —
+// returned "no PII, no credentials, no risk" for input never inspected.
 func (c *Client) AnalyzeShadowAI(ctx context.Context, req *ShadowAIRequest) (*ShadowAIResult, error) {
-	var result ShadowAIResult
-	if err := c.doRequest(ctx, http.MethodPost, "/shadow-ai", req, &result); err != nil {
+	if req == nil || req.Input == "" {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "AnalyzeShadowAI: req.Input is required"}
+	}
+	var raw json.RawMessage
+	if err := c.doRequest(ctx, http.MethodPost, "/shadow-ai", req, &raw); err != nil {
 		return nil, fmt.Errorf("AnalyzeShadowAI: %w", err)
+	}
+	// The typed shadow is decoded from the SAME bytes as the maps: the public
+	// map fields cannot carry presence, and re-marshalling them would erase the
+	// absent-vs-null distinction the probe exists for.
+	var result ShadowAIResult
+	verdict := shadowAIVerdict{inputChars: len(req.Input)}
+	if len(raw) > 0 {
+		_ = json.Unmarshal(raw, &result)
+		_ = json.Unmarshal(raw, &verdict)
+	}
+	if f := verdict.missingVerdictField(); f != "" {
+		return nil, indeterminateVerdict("AnalyzeShadowAI", f, "POST /shadow-ai")
+	}
+	if reason := verdict.inconsistency(); reason != "" {
+		return nil, uninterpretableVerdict("AnalyzeShadowAI", "POST /shadow-ai", reason)
 	}
 	return &result, nil
 }
@@ -1569,9 +1660,19 @@ func (c *Client) RunGuardrails(ctx context.Context, text, projectID string) (map
 	if projectID != "" {
 		body["projectId"] = projectID
 	}
-	var result map[string]any
-	if err := c.doRequest(ctx, http.MethodPost, "/guardrails", body, &result); err != nil {
+	var verdict GuardrailsResult
+	result, err := c.postGuardedMap(ctx, "/guardrails", body, &verdict)
+	if err != nil {
 		return nil, fmt.Errorf("RunGuardrails: %w", err)
+	}
+	// An absent `action` is "", which matches neither "block" nor "flag", so the
+	// caller's gate FORWARDED the text. This is the org-policy twin of
+	// CheckFirewall on the same request path and it refuses the same way.
+	if f := verdict.missingVerdictField(); f != "" {
+		return nil, indeterminateVerdict("RunGuardrails", f, "POST /guardrails")
+	}
+	if reason := verdict.inconsistency(); reason != "" {
+		return nil, uninterpretableVerdict("RunGuardrails", "POST /guardrails", reason)
 	}
 	return result, nil
 }
@@ -1601,9 +1702,22 @@ func (c *Client) ScanSecrets(ctx context.Context, req *SecretScanRequest) (map[s
 	if req == nil || (req.Content == "" && len(req.Files) == 0) {
 		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "ScanSecrets: provide Content or a non-empty Files array"}
 	}
-	var result map[string]any
-	if err := c.doRequest(ctx, http.MethodPost, "/security/secret-scan", req, &result); err != nil {
+	var verdict SecretScanResult
+	result, err := c.postGuardedMap(ctx, "/security/secret-scan", req, &verdict)
+	if err != nil {
 		return nil, fmt.Errorf("ScanSecrets: %w", err)
+	}
+	if f := verdict.missingVerdictField(); f != "" {
+		return nil, indeterminateVerdict("ScanSecrets", f, "POST /security/secret-scan")
+	}
+	// Bound to the REQUEST: a scan cannot have opened more files than this
+	// caller submitted (a single Content blob is scanned as one file).
+	submitted := len(req.Files)
+	if submitted == 0 {
+		submitted = 1
+	}
+	if reason := verdict.inconsistency(submitted); reason != "" {
+		return nil, uninterpretableVerdict("ScanSecrets", "POST /security/secret-scan", reason)
 	}
 	return result, nil
 }
@@ -1625,9 +1739,19 @@ func (c *Client) ClassifyIntent(ctx context.Context, prompt, orgID, sensitivityF
 	if sensitivityFloor != "" {
 		body["sensitivityFloor"] = sensitivityFloor
 	}
-	var result map[string]any
-	if err := c.doRequest(ctx, http.MethodPost, "/governance/intent/classify", body, &result); err != nil {
+	var verdict IntentClassification
+	result, err := c.postGuardedMap(ctx, "/governance/intent/classify", body, &verdict)
+	if err != nil {
 		return nil, fmt.Errorf("ClassifyIntent: %w", err)
+	}
+	if f := verdict.missingVerdictField(); f != "" {
+		return nil, indeterminateVerdict("ClassifyIntent", f, "POST /governance/intent/classify")
+	}
+	// Bound to the REQUEST: the classifier seeds sensitivity at the floor this
+	// caller asked for and only ever raises it, so a lower answer is a downgrade
+	// the server cannot legitimately have produced.
+	if reason := verdict.inconsistency(sensitivityFloor); reason != "" {
+		return nil, uninterpretableVerdict("ClassifyIntent", "POST /governance/intent/classify", reason)
 	}
 	return result, nil
 }
@@ -1639,9 +1763,19 @@ func (c *Client) LookupVulnerabilities(ctx context.Context, purls []string) (map
 		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "LookupVulnerabilities: purls must be a non-empty array"}
 	}
 	body := map[string]any{"purls": purls}
-	var result map[string]any
-	if err := c.doRequest(ctx, http.MethodPost, "/supply-chain/lookup", body, &result); err != nil {
+	var verdict SupplyChainLookupResult
+	result, err := c.postGuardedMap(ctx, "/supply-chain/lookup", body, &verdict)
+	if err != nil {
 		return nil, fmt.Errorf("LookupVulnerabilities: %w", err)
+	}
+	if f := verdict.missingVerdictField(); f != "" {
+		return nil, indeterminateVerdict("LookupVulnerabilities", f, "POST /supply-chain/lookup")
+	}
+	// Bound to the REQUEST, entry by entry: the lookup is 1:1 with the submitted
+	// purls IN ORDER, so a response about other packages cannot pass as a
+	// verdict on this dependency set.
+	if reason := verdict.inconsistency(purls); reason != "" {
+		return nil, uninterpretableVerdict("LookupVulnerabilities", "POST /supply-chain/lookup", reason)
 	}
 	return result, nil
 }
@@ -1660,9 +1794,19 @@ func (c *Client) ScanIaC(ctx context.Context, files []IaCFile) (map[string]any, 
 		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "ScanIaC: at least one file is required"}
 	}
 	body := map[string]any{"files": files}
-	var result map[string]any
-	if err := c.doRequest(ctx, http.MethodPost, "/security/iac-scan", body, &result); err != nil {
+	var verdict IaCScanResult
+	result, err := c.postGuardedMap(ctx, "/security/iac-scan", body, &verdict)
+	if err != nil {
 		return nil, fmt.Errorf("ScanIaC: %w", err)
+	}
+	if f := verdict.missingVerdictField(); f != "" {
+		return nil, indeterminateVerdict("ScanIaC", f, "POST /security/iac-scan")
+	}
+	// Bound to the REQUEST: scanIacFiles() sets scannedFiles to files.length
+	// unconditionally, so a shortfall means the apply gate is reading a verdict
+	// about only part of the infrastructure.
+	if reason := verdict.inconsistency(len(files)); reason != "" {
+		return nil, uninterpretableVerdict("ScanIaC", "POST /security/iac-scan", reason)
 	}
 	return result, nil
 }
@@ -1906,11 +2050,24 @@ func (c *Client) GetSecurityReport(ctx context.Context, assessmentID string) (ma
 }
 
 // CodeScan scans code for security vulnerabilities.
+//
+// Fails CLOSED: a 2xx with no `findingsCount`/`findings` is NO VERDICT, not a
+// clean build. Both keys assert to nil when absent, so `if len(findings) > 0 {
+// fail }` passed a scan that never parsed a line.
 func (c *Client) CodeScan(ctx context.Context, code, language, projectID string) (map[string]any, error) {
 	body := map[string]any{"code": code, "language": language, "projectId": projectID}
-	var result map[string]any
-	if err := c.doRequest(ctx, http.MethodPost, "/security/code-scan", body, &result); err != nil {
+	var verdict CodeScanResult
+	result, err := c.postGuardedMap(ctx, "/security/code-scan", body, &verdict)
+	if err != nil {
 		return nil, fmt.Errorf("CodeScan: %w", err)
+	}
+	if f := verdict.missingVerdictField(); f != "" {
+		return nil, indeterminateVerdict("CodeScan", f, "POST /security/code-scan")
+	}
+	// Bound to the REQUEST: a scan that parsed the code as a DIFFERENT language
+	// than it was written in finds nothing and reports zero findings.
+	if reason := verdict.inconsistency(language); reason != "" {
+		return nil, uninterpretableVerdict("CodeScan", "POST /security/code-scan", reason)
 	}
 	return result, nil
 }
@@ -3150,6 +3307,17 @@ func (c *Client) ReportAbuse(ctx context.Context, req *ReportAbuseRequest) (*Rep
 	if err := c.doRequest(ctx, http.MethodPost, "/abuse-reports", req, &result); err != nil {
 		return nil, fmt.Errorf("ReportAbuse: %w", err)
 	}
+	// An absent triage read as "no severity, do not escalate, do not feed the
+	// detector" — a CSAM or self-harm report dropping silently out of the human
+	// review queue.
+	if result.Triage.Severity == "" {
+		return nil, indeterminateVerdict("ReportAbuse", "triage.severity", "POST /abuse-reports")
+	}
+	// Bound to the REQUEST: both escalation flags and the dedup key are derived
+	// from the category and subject THIS caller filed.
+	if reason := result.Triage.inconsistency(req.Category, req.SubjectID); reason != "" {
+		return nil, uninterpretableVerdict("ReportAbuse", "POST /abuse-reports", reason)
+	}
 	return &result, nil
 }
 
@@ -3863,9 +4031,19 @@ func (c *Client) IngestRAGDocuments(ctx context.Context, req *IngestRAGRequest) 
 	if len(req.Documents) == 0 {
 		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "IngestRAGDocuments: at least one document is required"}
 	}
-	var result map[string]any
-	if err := c.doRequest(ctx, http.MethodPost, "/rag/ingest", req, &result); err != nil {
+	var verdict RAGIngestResult
+	result, err := c.postGuardedMap(ctx, "/rag/ingest", req, &verdict)
+	if err != nil {
 		return nil, fmt.Errorf("IngestRAGDocuments: %w", err)
+	}
+	// This path runs the SAME DLP + prompt-injection screening ScanRAGInjection
+	// was hardened for; an absent report is screening that did not happen, not
+	// documents that came back clean.
+	if f := verdict.missingVerdictField(); f != "" {
+		return nil, indeterminateVerdict("IngestRAGDocuments", f, "POST /rag/ingest")
+	}
+	if reason := verdict.inconsistency(len(req.Documents)); reason != "" {
+		return nil, uninterpretableVerdict("IngestRAGDocuments", "POST /rag/ingest", reason)
 	}
 	return result, nil
 }
@@ -4218,6 +4396,611 @@ func (c *Client) ScanRAGInjection(ctx context.Context, projectID string, documen
 }
 
 // --- Multimodal moderation (image / video / deepfake) ---
+//
+// AUDIT 2026-08-06 (fail-open sweep, CLASS 1 — third pass). ModerateImage,
+// ModerateVideo and DetectMediaDeepfake carried the SAME defect 1.5.0 closed on
+// /firewall/check, reached through a different return type. They hand back
+// map[string]any and the caller's gate is `res["flagged"].(bool)` /
+// `res["synthetic"].(bool)`; a type assertion on an ABSENT key yields the zero
+// value, and the one-value form does not panic on a missing key the way it does
+// on a wrong type. So `{}`, an empty body, `null`, `{"data":null}`, an envelope
+// with no verdict, and any unrelated HTTP 200 all read as "clean image,
+// authentic media" with err == nil.
+//
+// ModerateImage's doc comment used to end "Fails closed." That was a claim about
+// the SERVER engine (moderateImage() in packages/core/src/image/moderation.ts
+// returns flagged:true when the vision backend throws). The Go CLIENT did the
+// opposite — it degraded to a zero-valued map and reported success. The comments
+// below now describe the client's own behaviour.
+//
+// The map[string]any return type is kept ON PURPOSE. 1.5.0 changed BEHAVIOUR (an
+// unreadable verdict becomes an error) and only ADDED public API; it broke no
+// signature, which is what let it ship as a MINOR. Swapping these three to typed
+// returns would break every existing caller's compile. So the typed,
+// presence-tracking structs below are decoded ALONGSIDE the map, they decide the
+// refusal, and the map is handed back untouched when — and only when — the
+// verdict is real. HasVerdict is exported on each for the same reason it is on
+// FirewallCheckResponse: a caller decoding a stored or proxied body itself needs
+// the identical check.
+
+// Server-side defaults from packages/core/src/image (`opts.threshold ?? 0.7`,
+// `?? 0.5`, `?? 16`, `?? 1`). The request structs use `omitempty`, so a zero
+// value never reaches the wire and the server applies these — mirroring them is
+// what lets the client re-derive the verdict from the same inputs the engine had.
+const (
+	defaultVisionModerationThreshold = 0.7
+	defaultMediaDeepfakeThreshold    = 0.5
+	defaultMediaMaxFrames            = 16
+	defaultMediaSampleEveryN         = 1
+)
+
+// mediaFloatTolerance absorbs the last-bit difference an aggregate can pick up
+// crossing the wire. Selections (max) and comparisons are checked EXACTLY;
+// only the running mean, which accumulates rounding, is compared with slack.
+const mediaFloatTolerance = 1e-9
+
+// mediaBinding carries what only the CALLER knows: the request this response is
+// supposed to be about. A response can restate none of it, so it cannot move its
+// own goalposts — the same reason AuditMcpServer binds to len(tools).
+//
+// The zero-ish sentinels mean "unknown", for a caller decoding a stored body
+// through HasVerdict() with no request in hand.
+type mediaBinding struct {
+	threshold    float64 // < 0: unknown
+	frameCount   int     // < 0: unknown
+	maxFrames    int
+	sampleEveryN int
+	kind         string // "": unknown
+}
+
+// unknownMediaBinding drops every request-side check and keeps the ones a body
+// can be judged against on its own terms.
+var unknownMediaBinding = mediaBinding{threshold: -1, frameCount: -1}
+
+// expectedSampledFrames mirrors moderateVideoFrames() / detectVideoDeepfake()
+// exactly: `frames.filter((_, i) => i % sampleEveryN === 0).slice(0, maxFrames)`,
+// i.e. min(maxFrames, ceil(total / sampleEveryN)).
+func expectedSampledFrames(total, sampleEveryN, maxFrames int) int {
+	if sampleEveryN < 1 {
+		sampleEveryN = 1
+	}
+	if maxFrames < 1 {
+		maxFrames = 1
+	}
+	n := (total + sampleEveryN - 1) / sampleEveryN
+	if n > maxFrames {
+		n = maxFrames
+	}
+	return n
+}
+
+// sameStringSet reports whether got and want hold the same distinct values.
+// Order is not part of the contract (the engine builds the union from a Set).
+func sameStringSet(got, want []string) bool {
+	g := map[string]bool{}
+	for _, s := range got {
+		g[s] = true
+	}
+	w := map[string]bool{}
+	for _, s := range want {
+		w[s] = true
+	}
+	if len(g) != len(w) {
+		return false
+	}
+	for s := range w {
+		if !g[s] {
+			return false
+		}
+	}
+	return true
+}
+
+// ImageModerationResult is the typed view of a POST /moderation/image body
+// (VisionModerationResult in packages/core/src/image/moderation.ts).
+//
+// `Flagged` zero-values to false and `Score` to 0.0 — on a 0..1 harm scale that
+// is the most benign reading available, so a 200 that is not a moderation result
+// read as "clean image, zero harm". Presence of each is tracked separately
+// because an explicit `flagged:false` (a real allow) and an absent `flagged` are
+// INDISTINGUISHABLE by value.
+type ImageModerationResult struct {
+	Flagged        bool               `json:"flagged"`
+	Score          float64            `json:"score"`
+	Categories     []string           `json:"categories"`
+	CategoryScores map[string]float64 `json:"categoryScores,omitempty"`
+	Provider       string             `json:"provider,omitempty"`
+	LatencyMs      float64            `json:"latencyMs,omitempty"`
+
+	flaggedPresent bool
+	scorePresent   bool
+}
+
+// UnmarshalJSON decodes the result and, separately, records which decision
+// fields the wire actually carried. The `alias` indirection is what keeps this
+// from recursing — a defined type with the same underlying struct has an empty
+// method set, so every other field is populated by the default decoder exactly
+// as before.
+func (r *ImageModerationResult) UnmarshalJSON(data []byte) error {
+	type alias ImageModerationResult
+	var probe struct {
+		Flagged *bool    `json:"flagged"`
+		Score   *float64 `json:"score"`
+	}
+	if err := json.Unmarshal(data, &probe); err != nil {
+		return err
+	}
+	var decoded alias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*r = ImageModerationResult(decoded)
+	r.flaggedPresent = probe.Flagged != nil
+	r.scorePresent = probe.Score != nil
+	return nil
+}
+
+// missingVerdictField names the decision field the body did not carry, or "".
+func (r *ImageModerationResult) missingVerdictField() string {
+	switch {
+	case r == nil, !r.flaggedPresent:
+		return "flagged"
+	case !r.scorePresent:
+		return "score"
+	}
+	return ""
+}
+
+// HasVerdict reports whether this body carried a moderation verdict this client
+// can ACT ON. POST /moderation/image always emits both `flagged` and `score`, so
+// false here means the body did not come from the moderation engine.
+func (r *ImageModerationResult) HasVerdict() bool {
+	return r != nil && r.missingVerdictField() == "" && r.inconsistency(unknownMediaBinding) == ""
+}
+
+// inconsistency describes why the result contradicts itself or the request that
+// produced it, or "" when it is coherent.
+func (r *ImageModerationResult) inconsistency(b mediaBinding) string {
+	if r == nil {
+		return "nil result"
+	}
+	if f := r.missingVerdictField(); f != "" {
+		return fmt.Sprintf("`%s` is absent", f)
+	}
+	// clamp01() in moderation.ts guarantees the range; anything else did not
+	// come through the engine, and a threshold comparison against it is
+	// meaningless.
+	if r.Score < 0 || r.Score > 1 {
+		return fmt.Sprintf("`score` is %v, outside the 0..1 range the engine clamps to", r.Score)
+	}
+	// DERIVATION — moderateImage() computes
+	// `flagged = backend.flagged === true || score >= threshold`, so a score at
+	// or above the threshold THIS caller asked for cannot coexist with
+	// `flagged:false`. The converse is legitimate: the backend may flag on its
+	// own below the threshold, so a low-score flag is not a contradiction.
+	if b.threshold >= 0 && !r.Flagged && r.Score >= b.threshold {
+		return fmt.Sprintf("`flagged` is false but `score` is %v at threshold %v — the engine derives "+
+			"`flagged` from `score >= threshold`, so these cannot both be true", r.Score, b.threshold)
+	}
+	return ""
+}
+
+// VideoModerationFrame is one moderated frame inside a VideoModerationResult.
+type VideoModerationFrame struct {
+	Index       int      `json:"index"`
+	TimestampMs *float64 `json:"timestampMs,omitempty"`
+	Flagged     bool     `json:"flagged"`
+	Score       float64  `json:"score"`
+	Categories  []string `json:"categories"`
+}
+
+// VideoModerationResult is the typed view of a POST /moderation/video body
+// (VideoModerationResult in packages/core/src/image/moderation.ts).
+//
+// Same zero-value hazard as the image path, plus a coverage one: `FramesTotal`
+// and `FramesEvaluated` both zero-value to 0, so "clean clip" and "no frame was
+// ever moderated" were the same answer.
+type VideoModerationResult struct {
+	Flagged           bool                   `json:"flagged"`
+	Score             float64                `json:"score"`
+	Categories        []string               `json:"categories"`
+	FirstFlaggedFrame *int                   `json:"firstFlaggedFrame,omitempty"`
+	FramesTotal       int                    `json:"framesTotal"`
+	FramesEvaluated   int                    `json:"framesEvaluated"`
+	Frames            []VideoModerationFrame `json:"frames"`
+	Provider          string                 `json:"provider,omitempty"`
+	LatencyMs         float64                `json:"latencyMs,omitempty"`
+
+	flaggedPresent bool
+	scorePresent   bool
+	framesPresent  bool
+}
+
+// UnmarshalJSON decodes the clip verdict and records which decision fields the
+// wire carried. `frames` is tracked too: it is the EVIDENCE the clip verdict is
+// aggregated from, and requiring it is what stops a rewritten body from deleting
+// the evidence to escape the derivation checks below.
+func (r *VideoModerationResult) UnmarshalJSON(data []byte) error {
+	type alias VideoModerationResult
+	var probe struct {
+		Flagged *bool                   `json:"flagged"`
+		Score   *float64                `json:"score"`
+		Frames  *[]VideoModerationFrame `json:"frames"`
+	}
+	if err := json.Unmarshal(data, &probe); err != nil {
+		return err
+	}
+	var decoded alias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*r = VideoModerationResult(decoded)
+	r.flaggedPresent = probe.Flagged != nil
+	r.scorePresent = probe.Score != nil
+	r.framesPresent = probe.Frames != nil
+	return nil
+}
+
+// missingVerdictField names the decision field the body did not carry, or "".
+func (r *VideoModerationResult) missingVerdictField() string {
+	switch {
+	case r == nil, !r.flaggedPresent:
+		return "flagged"
+	case !r.scorePresent:
+		return "score"
+	case !r.framesPresent:
+		return "frames"
+	}
+	return ""
+}
+
+// HasVerdict reports whether this body carried a clip verdict this client can
+// ACT ON — one backed by the per-frame evidence in the same body.
+func (r *VideoModerationResult) HasVerdict() bool {
+	return r != nil && r.missingVerdictField() == "" && r.inconsistency(unknownMediaBinding) == ""
+}
+
+// inconsistency describes why the clip verdict contradicts itself or the request
+// that produced it, or "" when it is coherent. Mirrors moderateVideoFrames()
+// exactly, so nothing a healthy engine emits is rejected.
+func (r *VideoModerationResult) inconsistency(b mediaBinding) string {
+	if r == nil {
+		return "nil result"
+	}
+	if f := r.missingVerdictField(); f != "" {
+		return fmt.Sprintf("`%s` is absent", f)
+	}
+	if r.Score < 0 || r.Score > 1 {
+		return fmt.Sprintf("`score` is %v, outside the 0..1 range the engine clamps to", r.Score)
+	}
+
+	// COVERAGE — a verdict about 2 of the 40 frames you submitted is not a
+	// verdict about the clip you asked about.
+	if b.frameCount >= 0 {
+		if r.FramesTotal != b.frameCount {
+			return fmt.Sprintf("`framesTotal` is %d but %d frame(s) were submitted — the result does not "+
+				"cover the clip this caller asked about", r.FramesTotal, b.frameCount)
+		}
+		if want := expectedSampledFrames(b.frameCount, b.sampleEveryN, b.maxFrames); r.FramesEvaluated != want {
+			return fmt.Sprintf("`framesEvaluated` is %d but sampling every %d of %d frame(s) capped at %d "+
+				"moderates %d — %d frame(s) were never looked at",
+				r.FramesEvaluated, b.sampleEveryN, b.frameCount, b.maxFrames, want, want-r.FramesEvaluated)
+		}
+	}
+	if r.FramesEvaluated < 1 {
+		return "`framesEvaluated` is 0 — no frame was moderated, so `flagged` reports on nothing"
+	}
+	if len(r.Frames) != r.FramesEvaluated {
+		return fmt.Sprintf("`framesEvaluated` is %d but `frames` carries %d per-frame result(s)",
+			r.FramesEvaluated, len(r.Frames))
+	}
+
+	// DERIVATION — the clip verdict is an aggregate of the per-frame results in
+	// the SAME body: flagged = ANY frame flagged, score = MAX frame score,
+	// firstFlaggedFrame = index of the first. Re-deriving is what catches the
+	// one-field edit that flips `flagged` to false on a body still reporting a
+	// flagged frame — the same edit that turned an MCP "block" into "pass".
+	wantFlagged := false
+	wantScore := 0.0
+	firstFlagged := -1
+	var wantCategories []string
+	for i, f := range r.Frames {
+		if f.Index != i {
+			return fmt.Sprintf("`frames[%d].index` is %d — the per-frame results are not the ordered "+
+				"sample the aggregate was built from", i, f.Index)
+		}
+		if f.Score < 0 || f.Score > 1 {
+			return fmt.Sprintf("`frames[%d].score` is %v, outside the 0..1 range the engine clamps to", i, f.Score)
+		}
+		if b.threshold >= 0 && !f.Flagged && f.Score >= b.threshold {
+			return fmt.Sprintf("`frames[%d]` is not flagged but scores %v at threshold %v — each frame is "+
+				"moderated by the same `score >= threshold` rule", i, f.Score, b.threshold)
+		}
+		if f.Score > wantScore {
+			wantScore = f.Score
+		}
+		if f.Flagged {
+			wantFlagged = true
+			if firstFlagged < 0 {
+				firstFlagged = i
+			}
+			wantCategories = append(wantCategories, f.Categories...)
+		}
+	}
+	if r.Flagged != wantFlagged {
+		return fmt.Sprintf("`flagged` is %t but %d of %d frame(s) are flagged — the clip verdict "+
+			"contradicts the frames in the same body", r.Flagged, countFlaggedFrames(r.Frames), len(r.Frames))
+	}
+	if r.Score != wantScore {
+		return fmt.Sprintf("`score` is %v but the worst frame scores %v — the clip score is the max "+
+			"across moderated frames", r.Score, wantScore)
+	}
+	switch {
+	case firstFlagged >= 0 && r.FirstFlaggedFrame == nil:
+		return fmt.Sprintf("`firstFlaggedFrame` is absent but frame %d is flagged", firstFlagged)
+	case firstFlagged >= 0 && *r.FirstFlaggedFrame != firstFlagged:
+		return fmt.Sprintf("`firstFlaggedFrame` is %d but frame %d is the first flagged",
+			*r.FirstFlaggedFrame, firstFlagged)
+	case firstFlagged < 0 && r.FirstFlaggedFrame != nil:
+		return fmt.Sprintf("`firstFlaggedFrame` is %d but no frame is flagged", *r.FirstFlaggedFrame)
+	}
+	if !sameStringSet(r.Categories, wantCategories) {
+		return fmt.Sprintf("`categories` is %v but the flagged frames carry %v — the clip categories are "+
+			"the union across flagged frames", r.Categories, wantCategories)
+	}
+	return ""
+}
+
+func countFlaggedFrames(frames []VideoModerationFrame) int {
+	n := 0
+	for _, f := range frames {
+		if f.Flagged {
+			n++
+		}
+	}
+	return n
+}
+
+// DeepfakeLabelScore is one label/score pair from the forensic backend.
+type DeepfakeLabelScore struct {
+	Label string  `json:"label"`
+	Score float64 `json:"score"`
+}
+
+// MediaDeepfakeFrame is one scored frame inside a video MediaDeepfakeResult.
+type MediaDeepfakeFrame struct {
+	Index       int      `json:"index"`
+	TimestampMs *float64 `json:"timestampMs,omitempty"`
+	Synthetic   bool     `json:"synthetic"`
+	Probability float64  `json:"probability"`
+}
+
+// mediaDeepfakeKinds is the CLOSED set the route tags the body with
+// (apps/web/src/app/api/v1/moderation/deepfake/route.ts: `{ kind: "video", ... }`
+// / `{ kind: "image", ... }`). Matched EXACTLY, same rule and same reasoning as
+// mcpAuditVerdicts: a kind this client version does not recognise must DENY
+// rather than be folded into the nearest one it does.
+var mediaDeepfakeKinds = map[string]bool{"image": true, "video": true}
+
+// MediaDeepfakeResult is the typed view of a POST /moderation/deepfake body
+// (DeepfakeResult / VideoDeepfakeResult in packages/core/src/image/deepfake.ts,
+// tagged with `kind` by the route).
+//
+// The worst instance of the class in this file: `Synthetic` zero-values to false
+// and `Probability` to 0.0, which on a 0..1 synthetic-likelihood scale is
+// "certainly authentic". Both readings of the natural gate —
+// `if res.Synthetic { reject }` and `if res.Probability > threshold { reject }` —
+// accepted every sample whose score never arrived.
+type MediaDeepfakeResult struct {
+	Kind                string               `json:"kind"`
+	Synthetic           bool                 `json:"synthetic"`
+	Probability         float64              `json:"probability"`
+	MeanProbability     float64              `json:"meanProbability,omitempty"`
+	Label               string               `json:"label,omitempty"`
+	Scores              []DeepfakeLabelScore `json:"scores,omitempty"`
+	FirstSyntheticFrame *int                 `json:"firstSyntheticFrame,omitempty"`
+	FramesTotal         int                  `json:"framesTotal,omitempty"`
+	FramesEvaluated     int                  `json:"framesEvaluated,omitempty"`
+	Frames              []MediaDeepfakeFrame `json:"frames,omitempty"`
+	Provider            string               `json:"provider,omitempty"`
+	LatencyMs           float64              `json:"latencyMs,omitempty"`
+
+	syntheticPresent   bool
+	probabilityPresent bool
+	meanPresent        bool
+	framesPresent      bool
+}
+
+// UnmarshalJSON decodes the detection and records which decision fields the wire
+// carried, including the video-only aggregates so the two shapes can be told
+// apart by evidence rather than by the `kind` label alone.
+func (r *MediaDeepfakeResult) UnmarshalJSON(data []byte) error {
+	type alias MediaDeepfakeResult
+	var probe struct {
+		Synthetic       *bool                 `json:"synthetic"`
+		Probability     *float64              `json:"probability"`
+		MeanProbability *float64              `json:"meanProbability"`
+		Frames          *[]MediaDeepfakeFrame `json:"frames"`
+	}
+	if err := json.Unmarshal(data, &probe); err != nil {
+		return err
+	}
+	var decoded alias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*r = MediaDeepfakeResult(decoded)
+	r.syntheticPresent = probe.Synthetic != nil
+	r.probabilityPresent = probe.Probability != nil
+	r.meanPresent = probe.MeanProbability != nil
+	r.framesPresent = probe.Frames != nil
+	return nil
+}
+
+// missingVerdictField names the decision field the body did not carry, or "".
+func (r *MediaDeepfakeResult) missingVerdictField() string {
+	switch {
+	case r == nil, !r.syntheticPresent:
+		return "synthetic"
+	case !r.probabilityPresent:
+		return "probability"
+	case r.Kind == "video" && !r.framesPresent:
+		return "frames"
+	case r.Kind == "video" && !r.meanPresent:
+		return "meanProbability"
+	}
+	return ""
+}
+
+// HasVerdict reports whether this body carried a deepfake verdict this client
+// can ACT ON — a recognised `kind`, both decision fields, and (for a clip) the
+// per-frame evidence the aggregate is derived from.
+func (r *MediaDeepfakeResult) HasVerdict() bool {
+	return r != nil && r.missingVerdictField() == "" && r.inconsistency(unknownMediaBinding) == ""
+}
+
+// inconsistency describes why the detection contradicts itself or the request
+// that produced it, or "" when it is coherent. Mirrors detectImageDeepfake() /
+// detectVideoDeepfake() exactly.
+func (r *MediaDeepfakeResult) inconsistency(b mediaBinding) string {
+	if r == nil {
+		return "nil result"
+	}
+	if !mediaDeepfakeKinds[r.Kind] {
+		return fmt.Sprintf("`kind` is %s, which is not one of image/video", quoteVerdict(r.Kind))
+	}
+	if b.kind != "" && r.Kind != b.kind {
+		return fmt.Sprintf("`kind` is %q but this caller submitted a %s — the result is about "+
+			"different media", r.Kind, b.kind)
+	}
+	if f := r.missingVerdictField(); f != "" {
+		return fmt.Sprintf("`%s` is absent", f)
+	}
+	if r.Probability < 0 || r.Probability > 1 {
+		return fmt.Sprintf("`probability` is %v, outside the 0..1 range the engine clamps to", r.Probability)
+	}
+
+	if r.Kind == "image" {
+		// DERIVATION — detectImageDeepfake() computes
+		// `synthetic = probability >= threshold`, a pure comparison, so BOTH
+		// directions are checked: a body claiming authentic at a suspicious
+		// probability, and one claiming synthetic at a benign probability, are
+		// each a body the engine could not have produced for this request.
+		if b.threshold >= 0 {
+			if want := r.Probability >= b.threshold; r.Synthetic != want {
+				return fmt.Sprintf("`synthetic` is %t but probability %v against threshold %v derives %t — "+
+					"the engine derives `synthetic` from `probability >= threshold`",
+					r.Synthetic, r.Probability, b.threshold, want)
+			}
+		}
+		return ""
+	}
+
+	// --- video ---
+	if b.frameCount >= 0 {
+		if r.FramesTotal != b.frameCount {
+			return fmt.Sprintf("`framesTotal` is %d but %d frame(s) were submitted — the result does not "+
+				"cover the clip this caller asked about", r.FramesTotal, b.frameCount)
+		}
+		if want := expectedSampledFrames(b.frameCount, b.sampleEveryN, b.maxFrames); r.FramesEvaluated != want {
+			return fmt.Sprintf("`framesEvaluated` is %d but sampling every %d of %d frame(s) capped at %d "+
+				"scores %d — %d frame(s) were never looked at",
+				r.FramesEvaluated, b.sampleEveryN, b.frameCount, b.maxFrames, want, want-r.FramesEvaluated)
+		}
+	}
+	if r.FramesEvaluated < 1 {
+		return "`framesEvaluated` is 0 — no frame was scored, so `synthetic` reports on nothing"
+	}
+	if len(r.Frames) != r.FramesEvaluated {
+		return fmt.Sprintf("`framesEvaluated` is %d but `frames` carries %d per-frame result(s)",
+			r.FramesEvaluated, len(r.Frames))
+	}
+
+	wantSynthetic := false
+	wantProb := 0.0
+	sumProb := 0.0
+	firstSynthetic := -1
+	for i, f := range r.Frames {
+		if f.Index != i {
+			return fmt.Sprintf("`frames[%d].index` is %d — the per-frame results are not the ordered "+
+				"sample the aggregate was built from", i, f.Index)
+		}
+		if f.Probability < 0 || f.Probability > 1 {
+			return fmt.Sprintf("`frames[%d].probability` is %v, outside the 0..1 range the engine clamps to",
+				i, f.Probability)
+		}
+		if b.threshold >= 0 {
+			if want := f.Probability >= b.threshold; f.Synthetic != want {
+				return fmt.Sprintf("`frames[%d].synthetic` is %t but probability %v against threshold %v "+
+					"derives %t", i, f.Synthetic, f.Probability, b.threshold, want)
+			}
+		}
+		sumProb += f.Probability
+		if f.Probability > wantProb {
+			wantProb = f.Probability
+		}
+		if f.Synthetic {
+			wantSynthetic = true
+			if firstSynthetic < 0 {
+				firstSynthetic = i
+			}
+		}
+	}
+	if r.Synthetic != wantSynthetic {
+		return fmt.Sprintf("`synthetic` is %t but the per-frame results say %t — the clip verdict "+
+			"contradicts the frames in the same body", r.Synthetic, wantSynthetic)
+	}
+	if r.Probability != wantProb {
+		return fmt.Sprintf("`probability` is %v but the worst frame scores %v — the clip probability is "+
+			"the max across scored frames", r.Probability, wantProb)
+	}
+	// The mean is the one value that accumulates rounding, so it is the one
+	// compared with slack.
+	if wantMean := sumProb / float64(len(r.Frames)); math.Abs(r.MeanProbability-wantMean) > mediaFloatTolerance {
+		return fmt.Sprintf("`meanProbability` is %v but the frames average %v", r.MeanProbability, wantMean)
+	}
+	switch {
+	case firstSynthetic >= 0 && r.FirstSyntheticFrame == nil:
+		return fmt.Sprintf("`firstSyntheticFrame` is absent but frame %d is synthetic", firstSynthetic)
+	case firstSynthetic >= 0 && *r.FirstSyntheticFrame != firstSynthetic:
+		return fmt.Sprintf("`firstSyntheticFrame` is %d but frame %d is the first synthetic",
+			*r.FirstSyntheticFrame, firstSynthetic)
+	case firstSynthetic < 0 && r.FirstSyntheticFrame != nil:
+		return fmt.Sprintf("`firstSyntheticFrame` is %d but no frame is synthetic", *r.FirstSyntheticFrame)
+	}
+	return ""
+}
+
+// postGuardedMap runs one verdict-bearing POST and decodes the 2xx body
+// TWICE: into the caller's map (the historical, unbroken return shape) and into
+// verdict, the presence-tracking struct the refusal is decided on.
+//
+// Decoding the raw bytes rather than re-marshalling the map is deliberate — a
+// map round-trip cannot tell an absent key from one explicitly set to null, and
+// that distinction is the entire point of the presence probe.
+func (c *Client) postGuardedMap(ctx context.Context, path string, body, verdict any) (map[string]any, error) {
+	var raw json.RawMessage
+	if err := c.doRequest(ctx, http.MethodPost, path, body, &raw); err != nil {
+		return nil, err
+	}
+	// An empty body never reaches json.Unmarshal (doRequest skips it), which
+	// would leave every presence flag false anyway — but it would also leave
+	// verdict undecoded, so it is named explicitly rather than inferred.
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	var result map[string]any
+	if err := json.Unmarshal(raw, &result); err != nil {
+		// A 2xx whose body is not even a JSON object (a bare array, a string, a
+		// proxy's HTML error page) is not a verdict. Fall through with a nil map
+		// and let the caller's presence check refuse.
+		result = nil
+	}
+	if err := json.Unmarshal(raw, verdict); err != nil {
+		return result, nil
+	}
+	return result, nil
+}
 
 // ModerationFrame is a single video frame for frame-by-frame moderation.
 type ModerationFrame struct {
@@ -4240,8 +5023,14 @@ type ModerateImageRequest struct {
 }
 
 // ModerateImage runs BYO vision-model content moderation on a single image.
-// Requires a provider (OpenAI) key configured for the project. Fails closed.
+// Requires a provider (OpenAI) key configured for the project.
 // POST /api/v1/moderation/image.
+//
+// Fails CLOSED in the client: a 2xx that carries no `flagged`/`score` is not an
+// allow, it is NO VERDICT, and this returns ErrCodeIndeterminate rather than a
+// map whose missing keys assert to false and 0.0. Returning (nil, err) rather
+// than the decoded map is deliberate — an indeterminate verdict must not be
+// readable, or the zero value becomes the answer again at the next call site.
 func (c *Client) ModerateImage(ctx context.Context, req *ModerateImageRequest) (map[string]any, error) {
 	if req == nil || req.OrgID == "" || req.ProjectID == "" {
 		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "ModerateImage: orgID and projectID are required"}
@@ -4249,11 +5038,31 @@ func (c *Client) ModerateImage(ctx context.Context, req *ModerateImageRequest) (
 	if req.ImageURL == "" && req.ImageBase64 == "" {
 		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "ModerateImage: imageURL or imageBase64 is required"}
 	}
-	var result map[string]any
-	if err := c.doRequest(ctx, http.MethodPost, "/moderation/image", req, &result); err != nil {
+	var verdict ImageModerationResult
+	result, err := c.postGuardedMap(ctx, "/moderation/image", req, &verdict)
+	if err != nil {
 		return nil, fmt.Errorf("ModerateImage: %w", err)
 	}
+	if f := verdict.missingVerdictField(); f != "" {
+		return nil, indeterminateVerdict("ModerateImage", f, "POST /moderation/image")
+	}
+	// Bound to the REQUEST: the threshold is the one THIS caller asked for
+	// (Threshold is `omitempty`, so a zero never reaches the wire and the server
+	// applies its own default), so the response cannot restate it to escape the
+	// derivation check.
+	if reason := verdict.inconsistency(imageModerationBinding(req)); reason != "" {
+		return nil, uninterpretableVerdict("ModerateImage", "POST /moderation/image", reason)
+	}
 	return result, nil
+}
+
+// imageModerationBinding is the request-side half of the image check.
+func imageModerationBinding(req *ModerateImageRequest) mediaBinding {
+	th := req.Threshold
+	if th <= 0 {
+		th = defaultVisionModerationThreshold
+	}
+	return mediaBinding{threshold: th, frameCount: -1}
 }
 
 // ModerateVideoRequest is the payload for ModerateVideo.
@@ -4269,6 +5078,10 @@ type ModerateVideoRequest struct {
 
 // ModerateVideo runs BYO vision-model moderation across sampled video frames and
 // aggregates the per-frame verdicts. POST /api/v1/moderation/video.
+//
+// Fails CLOSED in the client, on two axes: a 2xx with no `flagged`/`score`/
+// `frames` is NO VERDICT, and a clip verdict that contradicts (or does not
+// cover) the frames this caller submitted is one the gate must not read.
 func (c *Client) ModerateVideo(ctx context.Context, req *ModerateVideoRequest) (map[string]any, error) {
 	if req == nil || req.OrgID == "" || req.ProjectID == "" {
 		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "ModerateVideo: orgID and projectID are required"}
@@ -4276,11 +5089,42 @@ func (c *Client) ModerateVideo(ctx context.Context, req *ModerateVideoRequest) (
 	if len(req.Frames) == 0 {
 		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "ModerateVideo: at least one frame is required"}
 	}
-	var result map[string]any
-	if err := c.doRequest(ctx, http.MethodPost, "/moderation/video", req, &result); err != nil {
+	var verdict VideoModerationResult
+	result, err := c.postGuardedMap(ctx, "/moderation/video", req, &verdict)
+	if err != nil {
 		return nil, fmt.Errorf("ModerateVideo: %w", err)
 	}
+	if f := verdict.missingVerdictField(); f != "" {
+		return nil, indeterminateVerdict("ModerateVideo", f, "POST /moderation/video")
+	}
+	if reason := verdict.inconsistency(videoMediaBinding(
+		defaultVisionModerationThreshold, req.Threshold, len(req.Frames), req.MaxFrames, req.SampleEveryN,
+	)); reason != "" {
+		return nil, uninterpretableVerdict("ModerateVideo", "POST /moderation/video", reason)
+	}
 	return result, nil
+}
+
+// videoMediaBinding is the request-side half of both frame-sampled checks. The
+// sampling knobs are `omitempty`, so a zero never reaches the wire and the
+// server applies its own default — which is what these fall back to.
+func videoMediaBinding(defaultThreshold, threshold float64, frameCount, maxFrames, sampleEveryN int) mediaBinding {
+	if threshold <= 0 {
+		threshold = defaultThreshold
+	}
+	if maxFrames <= 0 {
+		maxFrames = defaultMediaMaxFrames
+	}
+	if sampleEveryN <= 0 {
+		sampleEveryN = defaultMediaSampleEveryN
+	}
+	return mediaBinding{
+		threshold:    threshold,
+		frameCount:   frameCount,
+		maxFrames:    maxFrames,
+		sampleEveryN: sampleEveryN,
+		kind:         "video",
+	}
 }
 
 // DetectMediaDeepfakeRequest is the payload for DetectMediaDeepfake. For a single
@@ -4301,6 +5145,11 @@ type DetectMediaDeepfakeRequest struct {
 
 // DetectMediaDeepfake scores an image or video clip for AI-generated / deepfake
 // likelihood via the operator-deployed deepfake backend. POST /api/v1/moderation/deepfake.
+//
+// Fails CLOSED in the client. On a 0..1 synthetic-likelihood scale the zero
+// value is "certainly authentic", so BOTH readings of the natural gate
+// (`if res["synthetic"].(bool)` and `if probability > threshold`) used to accept
+// every sample whose score never arrived.
 func (c *Client) DetectMediaDeepfake(ctx context.Context, req *DetectMediaDeepfakeRequest) (map[string]any, error) {
 	if req == nil || req.OrgID == "" || req.ProjectID == "" {
 		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "DetectMediaDeepfake: orgID and projectID are required"}
@@ -4308,11 +5157,40 @@ func (c *Client) DetectMediaDeepfake(ctx context.Context, req *DetectMediaDeepfa
 	if req.ImageURL == "" && req.ImageBase64 == "" && len(req.Frames) == 0 {
 		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "DetectMediaDeepfake: provide imageURL/imageBase64 or frames"}
 	}
-	var result map[string]any
-	if err := c.doRequest(ctx, http.MethodPost, "/moderation/deepfake", req, &result); err != nil {
+	var verdict MediaDeepfakeResult
+	result, err := c.postGuardedMap(ctx, "/moderation/deepfake", req, &verdict)
+	if err != nil {
 		return nil, fmt.Errorf("DetectMediaDeepfake: %w", err)
 	}
+	if f := verdict.missingVerdictField(); f != "" {
+		return nil, indeterminateVerdict("DetectMediaDeepfake", f, "POST /moderation/deepfake")
+	}
+	// Bound to the REQUEST on three axes: the threshold asked for, the frames
+	// submitted, and the KIND — the binding re-derives which shape the route
+	// will answer with, so a body tagged with the other one is a result about
+	// different media however complete it looks.
+	if reason := verdict.inconsistency(deepfakeMediaBinding(req)); reason != "" {
+		return nil, uninterpretableVerdict("DetectMediaDeepfake", "POST /moderation/deepfake", reason)
+	}
 	return result, nil
+}
+
+// deepfakeMediaBinding is the request-side half of the deepfake check. It
+// re-derives the kind the route will pick the SAME way the route does
+// (`kind === "video" || (!imageUrl && !imageBase64 && !!frames)`), so a body
+// tagged with the other shape is caught.
+func deepfakeMediaBinding(req *DetectMediaDeepfakeRequest) mediaBinding {
+	isVideo := req.Kind == "video" || (req.ImageURL == "" && req.ImageBase64 == "" && len(req.Frames) > 0)
+	if !isVideo {
+		th := req.Threshold
+		if th <= 0 {
+			th = defaultMediaDeepfakeThreshold
+		}
+		return mediaBinding{threshold: th, frameCount: -1, kind: "image"}
+	}
+	return videoMediaBinding(
+		defaultMediaDeepfakeThreshold, req.Threshold, len(req.Frames), req.MaxFrames, req.SampleEveryN,
+	)
 }
 
 // --- MCP / agent security ---

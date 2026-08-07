@@ -9,7 +9,14 @@ import (
 func TestClassifyIntent(t *testing.T) {
 	var got map[string]any
 	c, cleanup := newJSONServer(t, "/governance/intent/classify", http.StatusOK,
-		map[string]any{"data": map[string]any{"intent": "harmful", "risk": "high"}}, &got)
+		// A REAL classifier body. `risk` was never a field the route emits; the
+		// six it does emit are below, and the full 13-entry score table is what
+		// lets the client check that "harmful" was not downgraded on the way back.
+		map[string]any{"data": map[string]any{
+			"intent": "harmful", "confidence": 1.0, "sensitivity": "restricted",
+			"riskScore": 1.0, "signals": []string{"intent:harmful:\"make a bomb\""},
+			"scores": map[string]any{"harmful": 9.0, "code-generation": 0.0, "data-analysis": 0.0, "research": 0.0, "content-creation": 0.0, "financial": 0.0, "legal": 0.0, "hr-personnel": 0.0, "security-ops": 0.0, "customer-support": 0.0, "translation": 0.0, "summarization": 0.0, "general": 0.0},
+		}}, &got)
 	defer cleanup()
 	r, err := c.ClassifyIntent(context.Background(), "how to make a bomb", "org-1", "confidential")
 	if err != nil {
@@ -36,7 +43,20 @@ func TestClassifyIntent_Validation(t *testing.T) {
 func TestLookupVulnerabilities(t *testing.T) {
 	var got map[string]any
 	c, cleanup := newJSONServer(t, "/supply-chain/lookup", http.StatusOK,
-		map[string]any{"data": map[string]any{"summary": map[string]any{"vulnerabilitiesFound": 7.0}}}, &got)
+		// A REAL lookup body: entries are 1:1 with the submitted purls IN ORDER,
+		// and every summary counter is derived from them.
+		map[string]any{"data": map[string]any{
+			"entries": []map[string]any{{
+				"purl": "pkg:npm/lodash@4.17.11", "status": "ok", "ecosystem": "npm",
+				"name": "lodash", "version": "4.17.11",
+				"vulnerabilities": []map[string]any{{"id": "GHSA-jf85-cpcp-j695", "cveId": "CVE-2019-10744"}},
+			}},
+			"summary": map[string]any{
+				"total": 1.0, "queried": 1.0, "unsupported": 0.0, "invalid": 0.0,
+				"vulnerable": 1.0, "vulnerabilitiesFound": 1.0,
+			},
+			"truncatedAdvisoryCount": 0.0,
+		}}, &got)
 	defer cleanup()
 	r, err := c.LookupVulnerabilities(context.Background(), []string{"pkg:npm/lodash@4.17.11"})
 	if err != nil {
@@ -60,7 +80,19 @@ func TestLookupVulnerabilities_Validation(t *testing.T) {
 func TestScanIaC(t *testing.T) {
 	var got map[string]any
 	c, cleanup := newJSONServer(t, "/security/iac-scan", http.StatusOK,
-		map[string]any{"data": map[string]any{"findingsCount": 2.0}}, &got)
+		// A REAL iac-scan body. `findingsCount: 2` with no `findings` is exactly
+		// the shape the fail-open produced, so it is no longer a valid fixture:
+		// scannedFiles, findings and bySeverity all have to agree.
+		map[string]any{"data": map[string]any{
+			"scannedFiles": 1.0, "findingsCount": 2.0,
+			"findings": []map[string]any{
+				{"ruleId": "tf-s3-public-acl", "severity": "critical", "file": "main.tf",
+					"line": 4.0, "title": "S3 bucket is public", "recommendation": "Set acl=private"},
+				{"ruleId": "tf-sg-open-ssh", "severity": "high", "file": "main.tf",
+					"line": 9.0, "title": "SSH open to 0.0.0.0/0", "recommendation": "Restrict CIDR"},
+			},
+			"bySeverity": map[string]any{"critical": 1.0, "high": 1.0, "medium": 0.0, "low": 0.0},
+		}}, &got)
 	defer cleanup()
 	r, err := c.ScanIaC(context.Background(), []IaCFile{{Filename: "main.tf", Content: "resource x"}})
 	if err != nil {
@@ -68,6 +100,9 @@ func TestScanIaC(t *testing.T) {
 	}
 	if r["findingsCount"] != 2.0 {
 		t.Errorf("findingsCount: %v", r["findingsCount"])
+	}
+	if findings, _ := r["findings"].([]any); len(findings) != 2 {
+		t.Errorf("findings not passed through: %v", r["findings"])
 	}
 	if files, _ := got["files"].([]any); len(files) != 1 {
 		t.Errorf("files not sent: %v", got)
