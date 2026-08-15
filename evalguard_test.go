@@ -1593,12 +1593,16 @@ func TestUserAgentMatchesClientVersion(t *testing.T) {
 // release so the userAgent/clientVersion/git-tag trio can't silently drift
 // again. v1.5.0 is live on proxy.golang.org, so the next release — and the
 // value both the client-version header and the User-Agent must advertise — is
-// 1.6.0 (MINOR again: thirteen more methods refuse an unreadable verdict, a
-// behaviour change, and everything else in the release is additive; see the
-// const block). Bump BOTH this constant and this assertion together each
-// release.
+// 1.6.2 (PATCH, 2026-08-12: 1.6.1 refused EVERY 3xx, and production itself
+// answers 308 on the verdict route for a base URL with a trailing slash, so
+// that blanket rule hard-fails a live customer's guardrail. 1.6.2 replaces it
+// with the SAME-HOST-ONLY follow. Nothing added, no signature changed, so only
+// the last position moves; see the const block. A Go module version is
+// immutable once the proxy has fetched the tag, which is why the correction
+// cannot reuse 1.6.1.). Bump BOTH this constant and this assertion together
+// each release.
 func TestClientVersionIsCurrentRelease(t *testing.T) {
-	const wantVersion = "1.6.0"
+	const wantVersion = "1.6.2"
 	if clientVersion != wantVersion {
 		t.Errorf("clientVersion: want %q, got %q", wantVersion, clientVersion)
 	}
@@ -1745,6 +1749,13 @@ func TestRAGAndModerationMethods(t *testing.T) {
 			_, _ = w.Write([]byte(`{"success":true,"data":{"scanned":2,"clean":false,"poisonedCount":1,"poisonedIndices":[1],"violations":[{"chunkIndex":1,"check":"prompt-injection","severity":"critical","message":"Instruction-override payload"}]}}`))
 			return
 		}
+		if r.URL.Path == "/monitoring/drift/detect" {
+			// A well-formed NO-DRIFT verdict. This test asserts the REQUEST
+			// contract; the response must still be one the client can interpret,
+			// or it is asserting the refusal path instead.
+			_, _ = w.Write([]byte(`{"success":true,"data":{"hasDrift":false,"overallDelta":0,"metricDeltas":[{"metric":"score","driftType":"quality","baselineMean":1,"currentMean":1,"pctChange":0,"zScore":0,"severity":"none"}],"alerts":[]}}`))
+			return
+		}
 		_, _ = w.Write([]byte(`{"success":true,"data":{"ok":true}}`))
 	}))
 	defer srv.Close()
@@ -1858,7 +1869,11 @@ func TestGetSecurityReport_SendsAssessmentIdQueryParam(t *testing.T) {
 		gotQuery = r.URL.RawQuery
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"success":true,"data":{"summary":"ok"}}`))
+		// A well-formed CLEAN report (RedTeamReport shape). The thin
+		// `{"summary":"ok"}` stub this used to carry is not a report the client
+		// can interpret, so it now exercises the refusal path instead of the
+		// query-param contract this test exists to pin.
+		_, _ = w.Write([]byte(`{"success":true,"data":{"executiveSummary":{"riskLevel":"low","overallScore":95,"totalVulnerabilities":0},"vulnerabilities":[],"complianceMapping":{"owasp":[],"nist":[],"avid":[]},"trends":{"byCategory":{},"bySeverity":{}},"recommendations":[]}}`))
 	}))
 	defer srv.Close()
 
@@ -1879,8 +1894,13 @@ func TestGetSecurityReport_SendsAssessmentIdQueryParam(t *testing.T) {
 	if strings.Contains(gotQuery, "scanId") {
 		t.Errorf("query %q must not contain the old scanId param", gotQuery)
 	}
-	if res["summary"] != "ok" {
-		t.Errorf("unexpected result: %v", res)
+	// The stub above is a RedTeamReport, so assert on that shape rather than
+	// the `summary:"ok"` placeholder the old thin stub carried.
+	if _, ok := res["executiveSummary"].(map[string]any); !ok {
+		t.Errorf("unexpected result, want a report carrying executiveSummary: %v", res)
+	}
+	if _, ok := res["vulnerabilities"].([]any); !ok {
+		t.Errorf("unexpected result, want a report carrying vulnerabilities: %v", res)
 	}
 }
 
@@ -1930,7 +1950,10 @@ func TestCheckCompliance_SendsFullContractBody(t *testing.T) {
 		_ = json.Unmarshal(raw, &gotBody)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
-		_, _ = w.Write([]byte(`{"success":true,"data":{"assessmentId":"a1","status":"compliant"}}`))
+		// A well-formed COMPLIANT assessment. `status` alone is not an
+		// assessment the client can interpret (no score, no per-requirement
+		// evidence), so the stub now matches ComplianceCheckResult.
+		_, _ = w.Write([]byte(`{"success":true,"data":{"assessmentId":"a1","status":"compliant","overallScore":100,"totalRequirements":0,"requirementResults":[],"scanRan":true,"savedToDatabase":true}}`))
 	}))
 	defer srv.Close()
 

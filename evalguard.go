@@ -31,8 +31,11 @@ import (
 	"io"
 	"math"
 	mrand "math/rand"
+	"net"
 	"net/http"
 	"net/url"
+	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -108,7 +111,31 @@ const (
 	// ErroredTests, SecurityScanResult.Queued(). No signature changed, so no
 	// consumer's build breaks. v1.5.0 is live on proxy.golang.org, so this
 	// number must not be reused.
-	clientVersion = "1.6.0"
+	// 2026-08-10: 1.6.0 -> 1.6.1. PATCH, and the reason is a security fix, not
+	// a feature: `v1.6.0` is live on proxy.golang.org and its bytes FOLLOW
+	// redirects on verdict-bearing calls, so a 302 returned a verdict about
+	// text the responder never received. Nothing was added and no signature
+	// changed. A Go module version is immutable once the proxy has fetched the
+	// tag, so `v1.6.0` cannot be corrected in place — this number is the only
+	// way the fix reaches a consumer.
+	//
+	// 2026-08-12: 1.6.1 -> 1.6.2. PATCH, and it CORRECTS 1.6.1's own fix.
+	// 1.6.1 refused EVERY 3xx. That closed the exfiltration hole and broke
+	// live customers, because PRODUCTION ITSELF REDIRECTS on the verdict
+	// route: measured against prod with manual redirects,
+	// `POST https://evalguard.ai/api/v1/firewall/check/` answers
+	// `308 Location: /api/v1/firewall/check`, and `http://` and `www.` both
+	// answer 301. A blanket refusal turns those into a hard-failing guardrail
+	// for anyone whose base URL carries a trailing slash. 1.6.2 replaces the
+	// blanket refusal with a SAME-HOST-ONLY follow (see
+	// sameHostRedirectTarget): the hop is followed only when scheme+host+PORT
+	// are unchanged, with no https->http downgrade, bounded at
+	// maxRedirectHops, preserving METHOD and BODY on every code including
+	// 301/302/303. A CROSS-HOST hop is still refused, and that refusal is
+	// still the whole control. Nothing added, no signature changed. `v1.6.1`
+	// may already be tagged, and a Go module version is immutable once the
+	// proxy has fetched the tag.
+	clientVersion = "1.6.2"
 	// userAgent is DERIVED from clientVersion (constant string concatenation is
 	// evaluated at compile time, so this stays a plain const) so the two can
 	// never drift. A prior audit found a hardcoded "evalguard-go/1.2.0" literal
@@ -241,8 +268,261 @@ func WithTimeout(d time.Duration) Option {
 }
 
 // WithHTTPClient sets a custom http.Client.
+//
+// NOTE: whatever CheckRedirect the supplied client carries is REPLACED at
+// construction (see disarmRedirects). Following a redirect is not a tunable on
+// a guardrail transport, so this option cannot re-enable it.
 func WithHTTPClient(hc *http.Client) Option {
 	return func(c *Client) { c.httpClient = hc }
+}
+
+// disarmRedirects returns a shallow copy of hc whose CheckRedirect refuses to
+// follow anything, surfacing the 3xx itself to the caller.
+//
+// AUDIT 2026-08-10 — A 302 DEFEATED EVERY VERDICT GUARD IN THIS SDK.
+//
+// `&http.Client{Timeout: ...}` leaves CheckRedirect nil, and nil means Go's
+// DEFAULT policy: follow up to 10 hops. For 301/302/303 the stdlib rewrites the
+// request to a **GET and drops the body**. So CheckFirewall("<attack>") became:
+//
+//	POST /firewall/check   -> 302 Location: http://attacker/
+//	GET  http://attacker/  (no body — the text was NEVER transmitted)
+//	<- 200 {"success":true,"data":{"blocked":false,"score":0, ...}}
+//
+// and this SDK returned a clean ALLOW. Measured 2026-08-10: 5 of 5 redirect
+// codes (301/302/303/307/308) fail open. The comment that used to sit on the
+// 2xx gate in doRaw — "the whole 3xx range this client's http.Client does NOT
+// follow" — was simply WRONG about the stdlib default, and the entire
+// verdict_guards.go suite scored 0/9 on this because every one of those guards
+// validates the SHAPE of a reply, and the reply here is perfectly well shaped.
+// It is a verdict about nothing. Shape cannot detect that; only refusing the
+// hop can.
+//
+// 307/308 are worse than a bypass: they PRESERVE the body, so the screened text
+// is POSTed verbatim to the redirect target. And because Go's
+// shouldCopyHeaderOnRedirect compares HOSTNAMES ONLY, a same-host/different-port
+// redirect FORWARDS the Authorization header — measured: the API key reached the
+// target.
+//
+// THIS FUNCTION STAYS (2026-08-12), even though the SDK now DOES follow a
+// same-host hop. The stdlib must never follow one ITSELF: its own same-origin
+// comparison ignores the PORT, which is precisely the comparison that leaked
+// the key. Disarming it here means every hop decision is made by
+// sameHostRedirectTarget on code we own and test, in one place, and the stdlib
+// is reduced to a single-request transport. "Never delegate this comparison to
+// the platform's own redirect follower" is the rule; this is how it is enforced.
+//
+// ErrUseLastResponse (rather than returning an error) is deliberate: it makes
+// the 3xx a normal *http.Response that flows into the hop loop in
+// doWithSameHostRedirects, so both the follow and the refusal are explicit
+// branches with real messages instead of an error string sniffed out of a
+// *url.Error, and a refusal is never retried.
+func disarmRedirects(hc *http.Client) *http.Client {
+	if hc == nil {
+		hc = &http.Client{Timeout: DefaultTimeout}
+	}
+	// Copy so a caller's client object is not mutated underneath them.
+	clone := *hc
+	clone.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	return &clone
+}
+
+// maxRedirectHops bounds the SAME-HOST redirect chain. The 4th redirect is
+// refused. A same-host redirect LOOP (a misconfigured rewrite rule pointing at
+// itself is the common cause) must terminate the call, not hang the guardrail:
+// a guardrail that hangs is a guardrail that gets ripped out.
+const maxRedirectHops = 3
+
+// hopStrippedHeaders are the credential-bearing headers that must NEVER cross a
+// host boundary. `x-evalguard-*` is handled separately as a PREFIX: every
+// header this SDK adds under that namespace is client telemetry that identifies
+// the customer's deployment and has no business on a third-party host.
+var hopStrippedHeaders = []string{"Authorization", "Cookie", "X-Api-Key"}
+
+// normalizedHostPort renders u's authority for HOST EQUALITY — the whole
+// control in the same-host redirect rule.
+//
+// Lowercased host (url.Parse already stores the punycode/IDNA form, and
+// Hostname() strips the brackets from an IPv6 literal) with the scheme's
+// DEFAULT port normalized away, so "https://h" and "https://h:443" compare
+// equal. An explicit NON-default port is PRESERVED, so "h:8080" never compares
+// equal to "h".
+//
+// The port is in the comparison on purpose. Go's stdlib
+// shouldCopyHeaderOnRedirect compares HOSTNAME ONLY, and that is exactly the
+// bug that forwarded the API key to a same-hostname/different-port target in
+// the 2026-08-10 measurement — a second listener on 127.0.0.1 is a completely
+// different program under completely different control.
+func normalizedHostPort(u *url.URL) string {
+	if u == nil {
+		return ""
+	}
+	host := strings.ToLower(u.Hostname())
+	port := u.Port()
+	switch {
+	case port == "":
+		// nothing to normalize
+	case u.Scheme == "http" && port == "80":
+		port = ""
+	case u.Scheme == "https" && port == "443":
+		port = ""
+	}
+	if port == "" {
+		return host
+	}
+	return net.JoinHostPort(host, port)
+}
+
+// sameHostRedirectTarget applies the SAME-HOST-ONLY redirect rule to a 3xx.
+//
+// It returns the resolved target and an EMPTY reason when the hop may be
+// followed. A NON-EMPTY reason means REFUSE, and names why; `to` is still
+// returned whenever it could be resolved so the refusal message can name the
+// host that was being redirected to.
+//
+// Why this exists at all: PRODUCTION REDIRECTS. Measured against live prod
+// 2026-08-12 with manual redirects,
+//
+//	POST https://evalguard.ai/api/v1/firewall/check/    -> 308  Location: /api/v1/firewall/check
+//	POST http://evalguard.ai/api/v1/firewall/check      -> 301  Location: https://evalguard.ai/...
+//	POST https://www.evalguard.ai/api/v1/firewall/check -> 301  Location: https://evalguard.ai/...
+//
+// The first two are the SAME host and must be followed or a trailing slash in
+// EVALGUARD_BASE_URL hard-fails the guardrail. The third is a HOST CHANGE and
+// is REFUSED — intentionally. `www.evalguard.ai` -> `evalguard.ai` is exactly
+// the shape of the exfiltration vector, and the rule is deliberately NOT
+// widened to "same registrable domain" to make that case disappear.
+func sameHostRedirectTarget(from *url.URL, resp *http.Response) (to *url.URL, reason string) {
+	if from == nil || resp == nil {
+		return nil, "no request URL to resolve the redirect against"
+	}
+	// More than one Location header is ambiguous: net/http hands back the
+	// first, an intermediary may act on the last. Refuse rather than pick.
+	if vals := resp.Header.Values("Location"); len(vals) > 1 {
+		return nil, fmt.Sprintf("the 3xx carried %d Location headers, which is ambiguous", len(vals))
+	}
+	loc := strings.TrimSpace(resp.Header.Get("Location"))
+	if loc == "" {
+		return nil, "the 3xx carried no Location header"
+	}
+	ref, err := url.Parse(loc)
+	if err != nil {
+		return nil, fmt.Sprintf("Location %q is not a parsable URL", truncateForMessage(loc))
+	}
+	// Relative Locations are LEGAL and are the common case — prod's 308 sends
+	// "/api/v1/firewall/check". ResolveReference also handles the
+	// scheme-relative "//host/path" form, which lands on a different host and
+	// is caught by the equality check below.
+	to = from.ResolveReference(ref)
+	if to == nil {
+		return nil, fmt.Sprintf("Location %q could not be resolved against %s", truncateForMessage(loc), from.String())
+	}
+	if to.Scheme != "http" && to.Scheme != "https" {
+		return to, fmt.Sprintf("the redirect target uses the %q scheme; only http and https are followable", to.Scheme)
+	}
+	if to.Host == "" {
+		return to, "the redirect target has no host"
+	}
+	if normalizedHostPort(to) != normalizedHostPort(from) {
+		return to, fmt.Sprintf("HOST CHANGE %s -> %s; a verdict may only come from the host you configured",
+			normalizedHostPort(from), normalizedHostPort(to))
+	}
+	if from.Scheme == "https" && to.Scheme == "http" {
+		return to, "PROTOCOL DOWNGRADE https -> http; the API key travels on every request and must never go out in cleartext"
+	}
+	return to, ""
+}
+
+// headersForHop returns the header set to send on the NEXT hop.
+//
+// It DELETES Authorization, Cookie, X-Api-Key and every `x-evalguard-*` header
+// when the target host differs from the current one.
+//
+// This is BELT-AND-BRACES and is called on the LIVE path, not only from tests.
+// sameHostRedirectTarget already refuses a host change, so in the shipped
+// configuration this function never has anything to strip. It exists anyway
+// because the alternative — relying on the HTTP library's own incidental
+// behaviour — is what leaked the API key on 2026-08-10, and because it must
+// keep holding if rule 4 is ever widened. An explicitly tested control does not
+// silently evaporate the way inherited behaviour does.
+func headersForHop(h http.Header, from, to *url.URL) http.Header {
+	out := make(http.Header, len(h))
+	for k, vs := range h {
+		for _, v := range vs {
+			out.Add(k, v) // Add canonicalizes the key, so Del below always matches
+		}
+	}
+	if from != nil && to != nil && normalizedHostPort(from) == normalizedHostPort(to) {
+		return out
+	}
+	for _, name := range hopStrippedHeaders {
+		out.Del(name)
+	}
+	for name := range out {
+		if strings.HasPrefix(strings.ToLower(name), "x-evalguard-") {
+			delete(out, name)
+		}
+	}
+	return out
+}
+
+// isNonReplayableBody reports whether a caller-supplied body is a ONE-SHOT
+// stream that cannot be re-transmitted on a second hop.
+//
+// A hop must re-send the SAME bytes. A stream is consumed by the first
+// request, so following a redirect with one would POST an EMPTY body and
+// produce a verdict about text the responder never received — the exact defect
+// this whole change exists to close. REFUSE instead of following.
+func isNonReplayableBody(body any) bool {
+	if body == nil {
+		return false
+	}
+	_, isStream := body.(io.Reader)
+	return isStream
+}
+
+// truncateForMessage bounds attacker-controlled server output (a Location
+// header) before it lands in an operator's logs.
+func truncateForMessage(s string) string {
+	const max = 120
+	if len(s) > max {
+		return s[:max] + "…"
+	}
+	return s
+}
+
+// redirectRefusal builds the fail-CLOSED error for a 3xx that must not be
+// followed. It names the STATUS, the FROM host, the TO host and the REASON, and
+// carries the EVALGUARD_BASE_URL remediation hint, so an operator can tell a
+// misconfigured base URL from an actual attack without reading this source.
+//
+// ErrCodeIndeterminate on purpose: it is the SAME code the rest of the "cannot
+// read a verdict" family uses, so a caller already branching on it catches this
+// without a code change. NEVER retried — a 3xx is a deterministic answer, and
+// re-issuing only re-transmits the screened text.
+func redirectRefusal(method, path string, status int, requestID string, from, to *url.URL, reason string) *EvalGuardError {
+	fromHost, toHost := "(unknown)", "(unresolved)"
+	if from != nil {
+		fromHost = from.Scheme + "://" + normalizedHostPort(from)
+	}
+	if to != nil && to.Host != "" {
+		toHost = to.Scheme + "://" + normalizedHostPort(to)
+	}
+	return &EvalGuardError{
+		Code:       ErrCodeIndeterminate,
+		StatusCode: status,
+		RequestID:  requestID,
+		Message: fmt.Sprintf(
+			"%s %s answered HTTP %d redirecting %s -> %s — REFUSED: %s. "+
+				"A guardrail verdict is an assertion about specific text, and this SDK follows a redirect ONLY when it "+
+				"stays on the same host (scheme+host+port compared exactly, no https->http downgrade, at most %d hops). "+
+				"Treat this as INDETERMINATE (deny); it is NOT an allow. "+
+				"If that target is where your API really lives, set EVALGUARD_BASE_URL to the FINAL URL directly "+
+				"(canonical host, no `www.`, no trailing slash, e.g. https://evalguard.ai/api/v1)",
+			method, path, status, fromHost, toHost, reason, maxRedirectHops),
+	}
 }
 
 // Client is the EvalGuard API client.
@@ -316,6 +596,10 @@ func NewClient(apiKey string, opts ...Option) (*Client, error) {
 	for _, o := range opts {
 		o(c)
 	}
+	// A REDIRECT IS NOT AN ANSWER — armed AFTER every option has run, so a
+	// caller-supplied WithHTTPClient cannot opt back into the bypass. See
+	// disarmRedirects.
+	c.httpClient = disarmRedirects(c.httpClient)
 	// Reject an insecure (plaintext, non-loopback) base URL now that any
 	// WithBaseURL override has been applied — WithBaseURL can't return an error
 	// itself, so the option's contract is enforced here at build time.
@@ -1232,9 +1516,15 @@ func (c *Client) CheckCompliance(ctx context.Context, req *ComplianceCheckReques
 	if req == nil {
 		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "CheckCompliance: req is required"}
 	}
-	var result map[string]any
-	if err := c.doRequest(ctx, http.MethodPost, "/compliance/check", req, &result); err != nil {
+	// Fails CLOSED (see verdict_guards_tier2.go): `passed` false / `gaps` nil read
+	// as gap-free, and `status` absent read as "not non-compliant".
+	var verdict complianceCheckProbe
+	result, err := c.getGuardedMap(ctx, http.MethodPost, "/compliance/check", req, &verdict)
+	if err != nil {
 		return nil, fmt.Errorf("CheckCompliance: %w", err)
+	}
+	if reason := verdict.check(); reason != "" {
+		return nil, uninterpretableVerdict("CheckCompliance", "POST /compliance/check", reason)
 	}
 	return result, nil
 }
@@ -1296,11 +1586,16 @@ func (c *Client) CreateEnvironment(ctx context.Context, projectID, name, tag str
 }
 
 // RemoveEnvironment removes a named environment.
+//
+// projectID is accepted for signature stability but unused: the flat route
+// resolves the org from the API key.
 func (c *Client) RemoveEnvironment(ctx context.Context, projectID, name string) (map[string]any, error) {
+	_ = projectID
+	// Flat route: DELETE /environments?name= (the org is resolved from auth).
 	q := url.Values{}
-	q.Set("projectId", projectID)
+	q.Set("name", name)
 	var result map[string]any
-	if err := c.doRequest(ctx, http.MethodDelete, "/environments/"+url.PathEscape(name)+"?"+q.Encode(), nil, &result); err != nil {
+	if err := c.doRequest(ctx, http.MethodDelete, "/environments?"+q.Encode(), nil, &result); err != nil {
 		return nil, fmt.Errorf("RemoveEnvironment: %w", err)
 	}
 	return result, nil
@@ -1310,33 +1605,46 @@ func (c *Client) RemoveEnvironment(ctx context.Context, projectID, name string) 
 // environment — the (project, environment, version) deployment mapping for the
 // prompt.
 func (c *Client) SetPromptDeployment(ctx context.Context, projectID, name, environment string, version int) (map[string]any, error) {
-	body := map[string]any{"projectId": projectID, "environment": environment, "version": version}
+	_ = projectID
+	// Flat route: POST /prompts/deployments — body {name, version, env}.
+	body := map[string]any{"name": name, "version": version, "env": environment}
 	var result map[string]any
-	if err := c.doRequest(ctx, http.MethodPost, "/prompts/"+url.PathEscape(name)+"/deployments", body, &result); err != nil {
+	if err := c.doRequest(ctx, http.MethodPost, "/prompts/deployments", body, &result); err != nil {
 		return nil, fmt.Errorf("SetPromptDeployment: %w", err)
 	}
 	return result, nil
 }
 
-// RemovePromptDeployment removes the deployed prompt version from an environment.
+// RemovePromptDeployment is UNSUPPORTED.
+//
+// The prompt deployments API exposes no DELETE route — there is no way to
+// un-deploy a prompt version from an environment. Deploy a different version
+// with SetPromptDeployment, or roll back via the deployments PUT action
+// (`action: "rollback"`).
+//
+// Deprecated: this call cannot succeed. Prior releases sent
+// DELETE /prompts/{name}/deployments, which no handler serves; the request
+// reached the api/v1 catch-all and returned 404. It now fails locally with a
+// typed error instead of spending a round trip to learn the same thing.
 func (c *Client) RemovePromptDeployment(ctx context.Context, projectID, name, environment string) (map[string]any, error) {
-	q := url.Values{}
-	q.Set("projectId", projectID)
-	q.Set("environment", environment)
-	var result map[string]any
-	if err := c.doRequest(ctx, http.MethodDelete, "/prompts/"+url.PathEscape(name)+"/deployments?"+q.Encode(), nil, &result); err != nil {
-		return nil, fmt.Errorf("RemovePromptDeployment: %w", err)
+	_, _, _, _ = ctx, projectID, name, environment
+	return nil, &EvalGuardError{
+		Code: ErrCodeValidation,
+		Message: "RemovePromptDeployment is not supported: the prompt deployments API has no " +
+			"DELETE route. Deploy a different version with SetPromptDeployment, or roll back " +
+			"via the deployments PUT action.",
 	}
-	return result, nil
 }
 
 // ListPromptEnvironments lists all environments and the prompt version deployed
 // to each.
 func (c *Client) ListPromptEnvironments(ctx context.Context, projectID, name string) ([]map[string]any, error) {
+	_ = projectID
+	// Flat route: GET /prompts/deployments?name= (returns current + history).
 	q := url.Values{}
-	q.Set("projectId", projectID)
+	q.Set("name", name)
 	var result []map[string]any
-	if err := c.doRequest(ctx, http.MethodGet, "/prompts/"+url.PathEscape(name)+"/environments?"+q.Encode(), nil, &result); err != nil {
+	if err := c.doRequest(ctx, http.MethodGet, "/prompts/deployments?"+q.Encode(), nil, &result); err != nil {
 		return nil, fmt.Errorf("ListPromptEnvironments: %w", err)
 	}
 	return result, nil
@@ -1364,13 +1672,15 @@ func (c *Client) CreateTool(ctx context.Context, projectID, name string, config 
 
 // GetTool gets a Tool (latest version, or a specific version when version > 0).
 func (c *Client) GetTool(ctx context.Context, projectID, name string, version int) (map[string]any, error) {
+	_ = projectID
+	// Flat route: GET /tools?name=&version= (a specific version returns one record).
 	q := url.Values{}
-	q.Set("projectId", projectID)
+	q.Set("name", name)
 	if version > 0 {
 		q.Set("version", fmt.Sprintf("%d", version))
 	}
 	var result map[string]any
-	if err := c.doRequest(ctx, http.MethodGet, "/tools/"+url.PathEscape(name)+"?"+q.Encode(), nil, &result); err != nil {
+	if err := c.doRequest(ctx, http.MethodGet, "/tools?"+q.Encode(), nil, &result); err != nil {
 		return nil, fmt.Errorf("GetTool: %w", err)
 	}
 	return result, nil
@@ -1389,10 +1699,12 @@ func (c *Client) ListTools(ctx context.Context, projectID string) ([]map[string]
 
 // ListToolVersions lists every version of a Tool, ascending by version number.
 func (c *Client) ListToolVersions(ctx context.Context, projectID, name string) ([]map[string]any, error) {
+	_ = projectID
+	// Flat route: GET /tools?name= returns all versions of that tool.
 	q := url.Values{}
-	q.Set("projectId", projectID)
+	q.Set("name", name)
 	var result []map[string]any
-	if err := c.doRequest(ctx, http.MethodGet, "/tools/"+url.PathEscape(name)+"/versions?"+q.Encode(), nil, &result); err != nil {
+	if err := c.doRequest(ctx, http.MethodGet, "/tools?"+q.Encode(), nil, &result); err != nil {
 		return nil, fmt.Errorf("ListToolVersions: %w", err)
 	}
 	return result, nil
@@ -1402,9 +1714,11 @@ func (c *Client) ListToolVersions(ctx context.Context, projectID, name string) (
 // environment — the (project, environment, version) deployment mapping for the
 // Tool.
 func (c *Client) SetToolDeployment(ctx context.Context, projectID, name, environment string, version int) (map[string]any, error) {
-	body := map[string]any{"projectId": projectID, "environment": environment, "version": version}
+	_ = projectID
+	// Flat route: POST /tools/deployments — body {toolName, version, env}.
+	body := map[string]any{"toolName": name, "version": version, "env": environment}
 	var result map[string]any
-	if err := c.doRequest(ctx, http.MethodPost, "/tools/"+url.PathEscape(name)+"/deployments", body, &result); err != nil {
+	if err := c.doRequest(ctx, http.MethodPost, "/tools/deployments", body, &result); err != nil {
 		return nil, fmt.Errorf("SetToolDeployment: %w", err)
 	}
 	return result, nil
@@ -1412,11 +1726,13 @@ func (c *Client) SetToolDeployment(ctx context.Context, projectID, name, environ
 
 // RemoveToolDeployment removes the deployed Tool version from an environment.
 func (c *Client) RemoveToolDeployment(ctx context.Context, projectID, name, environment string) (map[string]any, error) {
+	_ = projectID
+	// Flat route: DELETE /tools/deployments?name=&env=.
 	q := url.Values{}
-	q.Set("projectId", projectID)
-	q.Set("environment", environment)
+	q.Set("name", name)
+	q.Set("env", environment)
 	var result map[string]any
-	if err := c.doRequest(ctx, http.MethodDelete, "/tools/"+url.PathEscape(name)+"/deployments?"+q.Encode(), nil, &result); err != nil {
+	if err := c.doRequest(ctx, http.MethodDelete, "/tools/deployments?"+q.Encode(), nil, &result); err != nil {
 		return nil, fmt.Errorf("RemoveToolDeployment: %w", err)
 	}
 	return result, nil
@@ -1424,10 +1740,12 @@ func (c *Client) RemoveToolDeployment(ctx context.Context, projectID, name, envi
 
 // ListToolEnvironments lists all environments and the Tool version deployed to each.
 func (c *Client) ListToolEnvironments(ctx context.Context, projectID, name string) ([]map[string]any, error) {
+	_ = projectID
+	// Flat route: GET /tools/deployments?name= (returns environments + history).
 	q := url.Values{}
-	q.Set("projectId", projectID)
+	q.Set("name", name)
 	var result []map[string]any
-	if err := c.doRequest(ctx, http.MethodGet, "/tools/"+url.PathEscape(name)+"/environments?"+q.Encode(), nil, &result); err != nil {
+	if err := c.doRequest(ctx, http.MethodGet, "/tools/deployments?"+q.Encode(), nil, &result); err != nil {
 		return nil, fmt.Errorf("ListToolEnvironments: %w", err)
 	}
 	return result, nil
@@ -1435,10 +1753,12 @@ func (c *Client) ListToolEnvironments(ctx context.Context, projectID, name strin
 
 // GetToolEnvironmentVariables lists a Tool's environment variables.
 func (c *Client) GetToolEnvironmentVariables(ctx context.Context, projectID, name string) ([]ToolEnvironmentVariable, error) {
+	_ = projectID
+	// Flat route: GET /tools/env-vars?name=.
 	q := url.Values{}
-	q.Set("projectId", projectID)
+	q.Set("name", name)
 	var result []ToolEnvironmentVariable
-	if err := c.doRequest(ctx, http.MethodGet, "/tools/"+url.PathEscape(name)+"/environment-variables?"+q.Encode(), nil, &result); err != nil {
+	if err := c.doRequest(ctx, http.MethodGet, "/tools/env-vars?"+q.Encode(), nil, &result); err != nil {
 		return nil, fmt.Errorf("GetToolEnvironmentVariables: %w", err)
 	}
 	return result, nil
@@ -1449,9 +1769,14 @@ func (c *Client) AddToolEnvironmentVariable(ctx context.Context, projectID, name
 	if strings.TrimSpace(varName) == "" {
 		return nil, fmt.Errorf("AddToolEnvironmentVariable: environment variable name is required")
 	}
-	body := map[string]any{"projectId": projectID, "variable": ToolEnvironmentVariable{Name: varName, Value: value}}
+	_ = projectID
+	// Flat route: POST /tools/env-vars — body {name, variables: [{name, value}]}.
+	body := map[string]any{
+		"name":      name,
+		"variables": []ToolEnvironmentVariable{{Name: varName, Value: value}},
+	}
 	var result []ToolEnvironmentVariable
-	if err := c.doRequest(ctx, http.MethodPost, "/tools/"+url.PathEscape(name)+"/environment-variables", body, &result); err != nil {
+	if err := c.doRequest(ctx, http.MethodPost, "/tools/env-vars", body, &result); err != nil {
 		return nil, fmt.Errorf("AddToolEnvironmentVariable: %w", err)
 	}
 	return result, nil
@@ -1459,10 +1784,13 @@ func (c *Client) AddToolEnvironmentVariable(ctx context.Context, projectID, name
 
 // DeleteToolEnvironmentVariable deletes an environment variable from a Tool by name.
 func (c *Client) DeleteToolEnvironmentVariable(ctx context.Context, projectID, name, varName string) ([]ToolEnvironmentVariable, error) {
+	_ = projectID
+	// Flat route: DELETE /tools/env-vars?name=&varName=.
 	q := url.Values{}
-	q.Set("projectId", projectID)
+	q.Set("name", name)
+	q.Set("varName", varName)
 	var result []ToolEnvironmentVariable
-	if err := c.doRequest(ctx, http.MethodDelete, "/tools/"+url.PathEscape(name)+"/environment-variables/"+url.PathEscape(varName)+"?"+q.Encode(), nil, &result); err != nil {
+	if err := c.doRequest(ctx, http.MethodDelete, "/tools/env-vars?"+q.Encode(), nil, &result); err != nil {
 		return nil, fmt.Errorf("DeleteToolEnvironmentVariable: %w", err)
 	}
 	return result, nil
@@ -1961,10 +2289,22 @@ type FormalVerifyRequest struct {
 }
 
 // FormalVerify verifies AI output against formal constraints.
+//
+// Fails CLOSED (see verdict_guards_tier2.go): `violations`/`results` nil read as
+// "satisfies every constraint". The BINDING check is the one a rewritten body
+// cannot forge -- `totalConstraints` must equal the number of constraints this
+// caller SUBMITTED, so a response cannot silently drop the failing one.
 func (c *Client) FormalVerify(ctx context.Context, req *FormalVerifyRequest) (map[string]any, error) {
-	var result map[string]any
-	if err := c.doRequest(ctx, http.MethodPost, "/formal-verification", req, &result); err != nil {
+	if req == nil {
+		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "FormalVerify: req is required"}
+	}
+	var verdict formalVerifyProbe
+	result, err := c.getGuardedMap(ctx, http.MethodPost, "/formal-verification", req, &verdict)
+	if err != nil {
 		return nil, fmt.Errorf("FormalVerify: %w", err)
+	}
+	if reason := verdict.check(len(req.Constraints)); reason != "" {
+		return nil, uninterpretableVerdict("FormalVerify", "POST /formal-verification", reason)
 	}
 	return result, nil
 }
@@ -2039,12 +2379,22 @@ func (c *Client) GetSecurityEffectiveness(ctx context.Context, projectID string)
 // GET /api/v1/security/report?assessmentId=... — the report store is keyed by
 // assessmentId, so the query param MUST be "assessmentId". Sending "scanId"
 // 400s ("assessmentId query param is required") on every call.
+//
+// Fails CLOSED (see verdict_guards_tier2.go): `vulnerabilities` and
+// `executiveSummary` assert to nil when absent, so a 2xx that is not a report
+// read as "no vulnerabilities" and the CI gate went green. RunSecurityScan's
+// queued-scan refusal routes callers here, which is why this one was the most
+// urgent of the ten left open after 1.6.0.
 func (c *Client) GetSecurityReport(ctx context.Context, assessmentID string) (map[string]any, error) {
-	var result map[string]any
 	q := url.Values{}
 	q.Set("assessmentId", assessmentID)
-	if err := c.doRequest(ctx, http.MethodGet, "/security/report?"+q.Encode(), nil, &result); err != nil {
+	var verdict securityReportProbe
+	result, err := c.getGuardedMap(ctx, http.MethodGet, "/security/report?"+q.Encode(), nil, &verdict)
+	if err != nil {
 		return nil, fmt.Errorf("GetSecurityReport: %w", err)
+	}
+	if reason := verdict.check(); reason != "" {
+		return nil, uninterpretableVerdict("GetSecurityReport", "GET /security/report", reason)
 	}
 	return result, nil
 }
@@ -2201,23 +2551,31 @@ func (c *Client) GetCompliance(ctx context.Context, orgID string) ([]map[string]
 
 // GetComplianceGaps returns compliance gaps.
 func (c *Client) GetComplianceGaps(ctx context.Context, orgID, framework string) (map[string]any, error) {
-	var result map[string]any
 	q := url.Values{}
 	q.Set("orgId", orgID)
 	q.Set("framework", framework)
-	if err := c.doRequest(ctx, http.MethodGet, "/compliance/gaps?"+q.Encode(), nil, &result); err != nil {
+	var verdict complianceGapsProbe
+	result, err := c.getGuardedMap(ctx, http.MethodGet, "/compliance/gaps?"+q.Encode(), nil, &verdict)
+	if err != nil {
 		return nil, fmt.Errorf("GetComplianceGaps: %w", err)
+	}
+	if reason := verdict.check(); reason != "" {
+		return nil, uninterpretableVerdict("GetComplianceGaps", "GET /compliance/gaps", reason)
 	}
 	return result, nil
 }
 
 // GetEUAIAct returns EU AI Act compliance status.
 func (c *Client) GetEUAIAct(ctx context.Context, orgID string) (map[string]any, error) {
-	var result map[string]any
 	q := url.Values{}
 	q.Set("orgId", orgID)
-	if err := c.doRequest(ctx, http.MethodGet, "/compliance/eu-ai-act?"+q.Encode(), nil, &result); err != nil {
+	var verdict euAiActProbe
+	result, err := c.getGuardedMap(ctx, http.MethodGet, "/compliance/eu-ai-act?"+q.Encode(), nil, &verdict)
+	if err != nil {
 		return nil, fmt.Errorf("GetEUAIAct: %w", err)
+	}
+	if reason := verdict.check(); reason != "" {
+		return nil, uninterpretableVerdict("GetEUAIAct", "GET /compliance/eu-ai-act", reason)
 	}
 	return result, nil
 }
@@ -2414,11 +2772,17 @@ func (c *Client) GetDashboardStats(ctx context.Context) (map[string]any, error) 
 }
 
 // DetectDrift compares two eval runs for drift. POST /api/v1/monitoring/drift/detect.
+// Fails CLOSED (see verdict_guards_tier2.go): an absent `hasDrift` asserts to
+// false, which a release gate reads as "no regression, ship it".
 func (c *Client) DetectDrift(ctx context.Context, baselineRunID, currentRunID string) (map[string]any, error) {
 	body := map[string]any{"baselineRunId": baselineRunID, "currentRunId": currentRunID}
-	var result map[string]any
-	if err := c.doRequest(ctx, http.MethodPost, "/monitoring/drift/detect", body, &result); err != nil {
+	var verdict driftProbe
+	result, err := c.getGuardedMap(ctx, http.MethodPost, "/monitoring/drift/detect", body, &verdict)
+	if err != nil {
 		return nil, fmt.Errorf("DetectDrift: %w", err)
+	}
+	if reason := verdict.check(); reason != "" {
+		return nil, uninterpretableVerdict("DetectDrift", "POST /monitoring/drift/detect", reason)
 	}
 	return result, nil
 }
@@ -2842,6 +3206,19 @@ func (c *Client) FetchTraceAttachment(ctx context.Context, traceID, attachmentID
 	if err != nil {
 		return nil, "", fmt.Errorf("FetchTraceAttachment: %w", err)
 	}
+	// The binary sibling of requirePayload — this is the one method that reads
+	// doRaw directly, so the JSON gate in doRequest never sees it. A 204 or a
+	// bodyless 2xx handed the caller (nil bytes, nil error): an attachment that
+	// is indistinguishable from a zero-length file the customer really uploaded.
+	if len(respBody) == 0 {
+		return nil, "", &EvalGuardError{
+			Code:      ErrCodeIndeterminate,
+			RequestID: header.Get("X-Request-ID"),
+			Message: fmt.Sprintf("FetchTraceAttachment: GET %s answered HTTP 2xx with an EMPTY body — "+
+				"the attachment was NOT delivered, and empty bytes must not be handed back as its "+
+				"contents", path),
+		}
+	}
 	return respBody, header.Get("Content-Type"), nil
 }
 
@@ -2944,11 +3321,20 @@ type PromoteModelScanOpts struct {
 	Reason   string `json:"reason,omitempty"`
 }
 
+// PromoteModelScan promotes a scanned model into an environment.
+//
+// Fails CLOSED (see verdict_guards_tier2.go): `blocked`/`decision` absent read
+// as "promotion allowed". Bound to the REQUEST -- an approval naming a different
+// scanId, or a different target environment, is not an approval for this one.
 func (c *Client) PromoteModelScan(ctx context.Context, scanID string, opts PromoteModelScanOpts) (map[string]any, error) {
 	path := fmt.Sprintf("/security/model-scan/%s/promote", url.PathEscape(scanID))
-	var result map[string]any
-	if err := c.doRequest(ctx, http.MethodPost, path, opts, &result); err != nil {
+	var verdict promoteProbe
+	result, err := c.getGuardedMap(ctx, http.MethodPost, path, opts, &verdict)
+	if err != nil {
 		return nil, fmt.Errorf("PromoteModelScan: %w", err)
+	}
+	if reason := verdict.check(scanID, opts.ToEnv); reason != "" {
+		return nil, uninterpretableVerdict("PromoteModelScan", "POST "+path, reason)
 	}
 	return result, nil
 }
@@ -2956,9 +3342,13 @@ func (c *Client) PromoteModelScan(ctx context.Context, scanID string, opts Promo
 // GetModelScanAttestation returns the CycloneDX-ML 1.6 attestation JSON for a scan.
 func (c *Client) GetModelScanAttestation(ctx context.Context, scanID string) (map[string]any, error) {
 	path := fmt.Sprintf("/security/model-scan/%s/attestation", url.PathEscape(scanID))
-	var result map[string]any
-	if err := c.doRequest(ctx, http.MethodGet, path, nil, &result); err != nil {
+	var verdict attestationProbe
+	result, err := c.getGuardedMap(ctx, http.MethodGet, path, nil, &verdict)
+	if err != nil {
 		return nil, fmt.Errorf("GetModelScanAttestation: %w", err)
+	}
+	if reason := verdict.check(scanID); reason != "" {
+		return nil, uninterpretableVerdict("GetModelScanAttestation", "GET "+path, reason)
 	}
 	return result, nil
 }
@@ -3635,11 +4025,25 @@ func (c *Client) GetAgentMemoryGovernance(ctx context.Context, orgID string, pro
 	if projectID != nil {
 		q.Set("projectId", *projectID)
 	}
+	var raw json.RawMessage
+	if err := c.doRequest(ctx, http.MethodGet, "/agent-memory/governance?"+q.Encode(), nil, &raw); err != nil {
+		return nil, fmt.Errorf("GetAgentMemoryGovernance: %w", err)
+	}
+	// Fails CLOSED (see verdict_guards_tier2.go): the route emits `policy` on
+	// every response (an explicit null when none is configured), so an ABSENT key
+	// is not "governance off" -- but that is exactly what (nil, nil) reads as.
+	var verdict governanceProbe
+	if len(raw) > 0 {
+		_ = json.Unmarshal(raw, &verdict)
+	}
+	if reason := verdict.check(orgID); reason != "" {
+		return nil, uninterpretableVerdict("GetAgentMemoryGovernance", "GET /agent-memory/governance", reason)
+	}
 	var result struct {
 		Policy *MemoryGovernancePolicy `json:"policy"`
 	}
-	if err := c.doRequest(ctx, http.MethodGet, "/agent-memory/governance?"+q.Encode(), nil, &result); err != nil {
-		return nil, fmt.Errorf("GetAgentMemoryGovernance: %w", err)
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return nil, uninterpretableVerdict("GetAgentMemoryGovernance", "GET /agent-memory/governance", err.Error())
 	}
 	return result.Policy, nil
 }
@@ -3933,10 +4337,25 @@ func (c *Client) TranscribeVoice(ctx context.Context, projectID, audioBase64, la
 	if audioBase64 == "" {
 		return nil, &EvalGuardError{Code: ErrCodeValidation, Message: "TranscribeVoice: audioBase64 is required"}
 	}
-	var result TranscriptResult
 	body := voiceBody{ProjectID: projectID, AudioBase64: audioBase64, Language: language}
-	if err := c.doRequest(ctx, http.MethodPost, "/voice/transcribe", body, &result); err != nil {
+	var raw json.RawMessage
+	if err := c.doRequest(ctx, http.MethodPost, "/voice/transcribe", body, &raw); err != nil {
 		return nil, fmt.Errorf("TranscribeVoice: %w", err)
+	}
+	// Fails CLOSED (see verdict_guards_tier2.go): an EMPTY transcript is what
+	// downstream moderation reads as "nothing to screen", and an absent `text`
+	// decoded to exactly that. The ScoreVoiceDeepfake sidecar below was already
+	// guarded; this sibling was not.
+	var verdict transcriptProbe
+	if len(raw) > 0 {
+		_ = json.Unmarshal(raw, &verdict)
+	}
+	if reason := verdict.check(); reason != "" {
+		return nil, uninterpretableVerdict("TranscribeVoice", "POST /voice/transcribe", reason)
+	}
+	var result TranscriptResult
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return nil, uninterpretableVerdict("TranscribeVoice", "POST /voice/transcribe", err.Error())
 	}
 	return &result, nil
 }
@@ -5621,40 +6040,30 @@ func (c *Client) doRaw(ctx context.Context, method, path, accept string, body an
 			}
 		}
 
-		var bodyReader io.Reader
-		if bodyData != nil {
-			bodyReader = bytes.NewReader(bodyData)
-		}
-
-		req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, bodyReader)
+		// ONE attempt = one SAME-HOST hop chain. Every redirect decision is made
+		// inside doWithSameHostRedirects on code this package owns; the stdlib
+		// never follows a hop itself (see disarmRedirects).
+		resp, respBody, retryable, err := c.doWithSameHostRedirects(
+			ctx, method, path, accept, idempotencyKey, bodyData, !isNonReplayableBody(body))
 		if err != nil {
-			return nil, nil, &EvalGuardError{Code: ErrCodeNetworkFailure, Message: fmt.Sprintf("failed to create request: %v", err)}
-		}
-
-		req.Header.Set("Authorization", "Bearer "+c.apiKey)
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Accept", accept)
-		req.Header.Set("User-Agent", userAgent)
-		req.Header.Set("x-evalguard-client-version", clientVersion)
-		if idempotencyKey != "" {
-			// Same key on every attempt → server dedups the retry.
-			req.Header.Set("Idempotency-Key", idempotencyKey)
-		}
-
-		resp, err := c.httpClient.Do(req)
-		if err != nil {
-			if ctx.Err() == context.DeadlineExceeded {
-				return nil, nil, &EvalGuardError{Code: ErrCodeTimeout, Message: "request timed out"}
+			if retryable {
+				lastErr = err
+				continue
 			}
-			lastErr = &EvalGuardError{Code: ErrCodeNetworkFailure, Message: fmt.Sprintf("request failed: %v", err)}
-			continue
+			// A redirect refusal, a timeout or an unbuildable request. All
+			// deterministic — returned immediately, NEVER retried.
+			return nil, nil, err
 		}
 
-		respBody, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			lastErr = &EvalGuardError{Code: ErrCodeNetworkFailure, Message: fmt.Sprintf("failed to read response body: %v", err)}
-			continue
+		// DEFENCE IN DEPTH. doWithSameHostRedirects either follows a 3xx or
+		// refuses it, so a 3xx cannot reach here. If one ever does — someone
+		// added an early return, or a future edit widened the loop — refuse it
+		// rather than let it fall through to the "not a success" gate with a
+		// message that would not name the target host.
+		if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+			return nil, nil, redirectRefusal(method, path, resp.StatusCode,
+				resp.Header.Get("X-Request-ID"), resp.Request.URL, nil,
+				"a 3xx escaped the hop loop, which is a bug in this SDK; refusing rather than guessing")
 		}
 
 		if resp.StatusCode >= 400 {
@@ -5668,9 +6077,235 @@ func (c *Client) doRaw(ctx context.Context, method, path, accept string, body an
 			return nil, nil, lastErr
 		}
 
+		// A SUCCESS IS A 2xx. `>= 400` is a PROXY for "not a success" and lets in
+		// everything below 400 that is also not one — 1xx, and the 3xx range the
+		// branch above now claims. (Until 2026-08-10 this comment asserted that
+		// "this client's http.Client does NOT follow" redirects. It did follow
+		// them — Go's default CheckRedirect is nil, which means follow. The
+		// assertion was the bug; disarmRedirects made it true.)
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return nil, nil, &EvalGuardError{
+				Code:       ErrCodeIndeterminate,
+				StatusCode: resp.StatusCode,
+				RequestID:  resp.Header.Get("X-Request-ID"),
+				Message: fmt.Sprintf("%s %s answered HTTP %d, which is not a success — the response "+
+					"cannot be interpreted, so no verdict or result may be derived from it",
+					method, path, resp.StatusCode),
+			}
+		}
+
+		// A 2xx CARRYING `success:false` IS NOT A SUCCESS.
+		//
+		// AUDIT 2026-08-08 — the shared-boundary sibling of the CLASS 1 work in
+		// verdict_guards.go, and the reason a per-method fix was the wrong shape:
+		// this gate covers all 158 exported methods at once. `doRaw` accepted any
+		// status below 400, and `unmarshalEnvelope` then decoded whatever `data`
+		// (or the raw body) carried. Measured before the fix against a loopback
+		// listener answering HTTP 200 with
+		//
+		//   {"success":false,"error":{"code":"ENGINE_DOWN",...},
+		//    "data":{"blocked":false,"score":0,"category":""}}
+		//
+		//   CheckFirewall -> &{Blocked:false ... blockedPresent:true}, err=<nil>
+		//
+		// i.e. an explicit server-side FAILURE was read as a clean firewall ALLOW,
+		// and HasVerdict() could not help because the stale `data` blob supplied a
+		// syntactically present `blocked`. The bare form
+		// `{"success":false,"blocked":false}` did the same. List routes returned an
+		// empty slice and a nil error.
+		//
+		// Checked here rather than in doRequest so the binary-download path
+		// (FetchTraceAttachment) is covered by the same rule, and checked by
+		// PRESENCE-then-value so a non-enveloped route (the OpenAI-compatible
+		// /chat/completions passthrough, a bare JSON array, an octet-stream body)
+		// is untouched: only a body that explicitly says `"success": false` is
+		// refused. NOT retried — an application-level failure dressed as 200 is a
+		// protocol violation, not a transient one.
+		if err := rejectUnsuccessfulEnvelope(respBody, method, path, resp.Header.Get("X-Request-ID")); err != nil {
+			return nil, nil, err
+		}
+
 		return respBody, resp.Header, nil
 	}
 	return nil, nil, lastErr
+}
+
+// doWithSameHostRedirects issues ONE request and follows at most
+// maxRedirectHops SAME-HOST redirects, returning the FINAL response with its
+// body already read and closed.
+//
+// This is the hop loop. It exists because the platform's own redirect follower
+// cannot be trusted with this decision:
+//
+//   - Go's shouldCopyHeaderOnRedirect compares HOSTNAME ONLY. A
+//     same-hostname/DIFFERENT-PORT hop therefore forwards `Authorization`, and
+//     that is not a hypothetical — the API key reached the target in the
+//     2026-08-10 measurement.
+//   - On 301/302/303 the stdlib rewrites the request into a BODYLESS GET.
+//     That rewrite IS the original defect: the responder answers
+//     `{"blocked": false}` about text it never received.
+//
+// So this loop DELIBERATELY DEVIATES FROM RFC 9110 §15.4: METHOD, BODY and
+// HEADERS are preserved on EVERY 3xx code, 301/302/303 included. The target is
+// the same host we already authenticated to and already sent the text to, so
+// re-transmitting it is not an exfiltration — whereas silently downgrading to
+// GET manufactures a verdict about nothing.
+//
+// retryable is true ONLY for a transport-level failure (connection refused,
+// truncated read). A redirect refusal, a timeout and an unbuildable request are
+// all deterministic and must NOT be re-driven: re-issuing a refused 3xx would
+// only re-transmit the screened text.
+func (c *Client) doWithSameHostRedirects(
+	ctx context.Context,
+	method, path, accept, idempotencyKey string,
+	bodyData []byte,
+	bodyReplayable bool,
+) (resp *http.Response, respBody []byte, retryable bool, err error) {
+	curURL := c.baseURL + path
+	var fromURL *url.URL
+
+	for hop := 0; ; hop++ {
+		// A FRESH reader over the SAME bytes on every hop. A single
+		// io.Reader is consumed by the first Do(), so reusing one would POST
+		// an EMPTY body on hop 2 — a verdict about text that was never
+		// transmitted, which is the exact class of defect this file is
+		// fighting. bytes.Reader also gives http.NewRequestWithContext a
+		// known ContentLength and a GetBody.
+		var bodyReader io.Reader
+		if bodyData != nil {
+			bodyReader = bytes.NewReader(bodyData)
+		}
+
+		req, reqErr := http.NewRequestWithContext(ctx, method, curURL, bodyReader)
+		if reqErr != nil {
+			return nil, nil, false, &EvalGuardError{
+				Code:    ErrCodeNetworkFailure,
+				Message: fmt.Sprintf("failed to create request: %v", reqErr),
+			}
+		}
+
+		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", accept)
+		req.Header.Set("User-Agent", userAgent)
+		req.Header.Set("x-evalguard-client-version", clientVersion)
+		if idempotencyKey != "" {
+			// Same key on every attempt AND every hop → server dedups both.
+			req.Header.Set("Idempotency-Key", idempotencyKey)
+		}
+
+		// LIVE-PATH credential stripping. On hop 0 fromURL is nil and this is a
+		// no-op; on any later hop it is the belt-and-braces half of rule 9.
+		// sameHostRedirectTarget has already refused a host change, so this
+		// normally strips nothing — it is here so the control is explicit and
+		// tested rather than inherited from net/http, and so it keeps holding
+		// if the host rule is ever widened.
+		if fromURL != nil {
+			req.Header = headersForHop(req.Header, fromURL, req.URL)
+		}
+
+		httpResp, doErr := c.httpClient.Do(req)
+		if doErr != nil {
+			if ctx.Err() == context.DeadlineExceeded {
+				return nil, nil, false, &EvalGuardError{Code: ErrCodeTimeout, Message: "request timed out"}
+			}
+			return nil, nil, true, &EvalGuardError{
+				Code:    ErrCodeNetworkFailure,
+				Message: fmt.Sprintf("request failed: %v", doErr),
+			}
+		}
+
+		body, readErr := io.ReadAll(httpResp.Body)
+		httpResp.Body.Close()
+		if readErr != nil {
+			return nil, nil, true, &EvalGuardError{
+				Code:    ErrCodeNetworkFailure,
+				Message: fmt.Sprintf("failed to read response body: %v", readErr),
+			}
+		}
+
+		if httpResp.StatusCode < 300 || httpResp.StatusCode >= 400 {
+			return httpResp, body, false, nil
+		}
+
+		// ---- 3xx: decide, never delegate -------------------------------
+		requestID := httpResp.Header.Get("X-Request-ID")
+
+		// Rule 8: a one-shot body cannot be re-sent, so the hop would carry
+		// nothing. Refuse rather than follow.
+		if !bodyReplayable {
+			return nil, nil, false, redirectRefusal(method, path, httpResp.StatusCode, requestID, req.URL, nil,
+				"the request body is a one-shot stream and cannot be re-transmitted on a hop")
+		}
+		// Rule 6: bounded. Checked BEFORE resolving so a same-host loop
+		// terminates the call instead of hanging the guardrail.
+		if hop >= maxRedirectHops {
+			return nil, nil, false, redirectRefusal(method, path, httpResp.StatusCode, requestID, req.URL, nil,
+				fmt.Sprintf("TOO MANY HOPS — already followed %d same-host redirects, which is the maximum", maxRedirectHops))
+		}
+
+		to, reason := sameHostRedirectTarget(req.URL, httpResp)
+		if reason != "" {
+			return nil, nil, false, redirectRefusal(method, path, httpResp.StatusCode, requestID, req.URL, to, reason)
+		}
+
+		fromURL = req.URL
+		curURL = to.String()
+	}
+}
+
+// rejectUnsuccessfulEnvelope refuses a 2xx whose body explicitly declares
+// `"success": false`.
+//
+// PRESENCE, then value. `*bool` distinguishes "no success key" (a
+// non-enveloped route — /chat/completions, a bare array, a binary download)
+// from an explicit `false`. Only the explicit false is refused, so this cannot
+// break a route that never spoke the envelope.
+//
+// A body that is not JSON at all (an octet-stream attachment) fails the
+// unmarshal and is passed through untouched: this function's job is to catch
+// the server SAYING it failed, not to police body shape — that is
+// unmarshalEnvelope's and the per-method HasVerdict()'s job.
+func rejectUnsuccessfulEnvelope(body []byte, method, path, requestID string) error {
+	if len(body) == 0 {
+		return nil
+	}
+	var env struct {
+		Success *bool `json:"success"`
+		Error   *struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &env); err != nil {
+		return nil
+	}
+	if env.Success == nil || *env.Success {
+		return nil
+	}
+	// Prefer the server's own machine code when it sent one, exactly as
+	// handleErrorResponse does for a 4xx/5xx, so `success:false` with
+	// code "ENGINE_DOWN" reaches the caller as ENGINE_DOWN rather than being
+	// flattened. Otherwise ErrCodeIndeterminate — from a caller's point of view
+	// this is the same third outcome as "no verdict", and code already branching
+	// on ErrCodeIndeterminate catches it without a change.
+	code := ErrCodeIndeterminate
+	detail := ""
+	if env.Error != nil {
+		if env.Error.Code != "" {
+			code = ErrorCode(env.Error.Code)
+		}
+		if env.Error.Message != "" {
+			detail = ": " + env.Error.Message
+		}
+	}
+	return &EvalGuardError{
+		Code:      code,
+		RequestID: requestID,
+		Message: fmt.Sprintf("%s %s answered HTTP 2xx with `success:false`%s — the server declared this "+
+			"request FAILED, so any payload beside it is stale or synthetic and must not be read as a "+
+			"verdict, a result, or an allow", method, path, detail),
+	}
 }
 
 func (c *Client) doRequest(ctx context.Context, method, path string, body any, target any) error {
@@ -5679,16 +6314,196 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body any, t
 		return err
 	}
 
-	if target != nil && len(respBody) > 0 {
-		if err := unmarshalEnvelope(respBody, target); err != nil {
-			return &EvalGuardError{
-				Code:      ErrCodeInternal,
-				Message:   fmt.Sprintf("failed to decode response: %v", err),
-				RequestID: header.Get("X-Request-ID"),
+	if target != nil {
+		// A 2xx THAT ANSWERS NOTHING IS NOT AN ANSWER.
+		//
+		// AUDIT 2026-08-09 — the shared-boundary sibling of the per-method
+		// verdict guards, and the reason a per-method fix was the wrong shape
+		// twice already. `len(respBody) > 0` made an empty body a SILENT
+		// SUCCESS: the target kept its zero value and the caller got
+		// (zero-struct, nil). Measured against this tree with a loopback
+		// listener, before this gate, 93 of the 109 payload-bearing exported
+		// methods read as a clean/empty result on every one of six modes —
+		// missing-verdict, `data:null`, `{}`, 204, 200-with-no-body and a
+		// literal `null` body:
+		//
+		//   GetAuditLogs   -> &AuditLogsResponse{Logs:nil, Total:0}, err=<nil>
+		//                     i.e. "no audit activity" out of a 204
+		//   ListGuardrails -> nil slice, err=<nil>  ("no guardrails configured")
+		//   DetectLanguage -> &LanguageDetection{Language:"", Confidence:0}
+		//
+		// Placed here rather than in the 100-odd call sites because that is what
+		// makes it TOTAL: every method that asks for a payload gets the rule,
+		// including method #159. A `nil` target (a DELETE that returns nothing)
+		// has no payload contract and is deliberately untouched — a bodyless 2xx
+		// really is "done" there.
+		if err := requirePayload(respBody, target, method, path, header.Get("X-Request-ID")); err != nil {
+			return err
+		}
+		// `len(respBody) > 0` is still required around the decode. requirePayload
+		// has already refused an empty body for every target that does not carry
+		// its own guard, so the only way to get here with no body is a
+		// SELF-GUARDED target — and for those, decoding nothing yields
+		// "unexpected end of JSON input", i.e. an INTERNAL_ERROR, in place of the
+		// INDETERMINATE_VERDICT their own guard raises one line later. Dropping
+		// this condition swapped a precise security verdict for a parse error on
+		// RunSecurityScan; the error TYPE is what callers branch on.
+		if len(respBody) > 0 {
+			if err := unmarshalEnvelope(respBody, target); err != nil {
+				return &EvalGuardError{
+					Code:      ErrCodeInternal,
+					Message:   fmt.Sprintf("failed to decode response: %v", err),
+					RequestID: header.Get("X-Request-ID"),
+				}
 			}
 		}
 	}
 	return nil
+}
+
+// requirePayload refuses a 2xx that carries no usable payload for a caller that
+// asked for one. Four rules, in order of how little the wire said:
+//
+//  1. no body at all              — a 204/empty 2xx on a route with a target
+//  2. a literal `null` body       — the envelope-less form of the same thing
+//  3. `data: null` in an envelope — the enveloped form
+//  4. an object sharing NO key with the target type — the response is about
+//     something else entirely, e.g. `{"latencyMs":3}` handed to a caller
+//     expecting AuditLogsResponse{logs,total}. Zero overlap also covers `{}`.
+//
+// Rule 4 is skipped when the target is not a struct: a `[]T` target legitimately
+// receives an EMPTY array (a list route with nothing in it is a real answer, not
+// a missing one), and a `map[string]any` / `json.RawMessage` target declares no
+// fields to overlap with — those are the raw security routes, which carry their
+// own presence/validity/evidence guards in verdict_guards*.go.
+func requirePayload(respBody []byte, target any, method, path, requestID string) error {
+	// STAND DOWN FOR A SELF-GUARDED RESULT.
+	//
+	// A target that implements HasVerdict() carries its OWN, STRONGER guard
+	// downstream of this decode — the presence/validity/evidence rules in
+	// verdict_guards*.go, which name the exact field that was missing. These
+	// generic rules ("the payload shares no key with the target", "the payload is
+	// `{}`") are a FLOOR for the ~100 methods that have no guard of their own;
+	// running them here as well only pre-empts a more specific check with a
+	// vaguer message. Measured: with the generic gate first, CheckFirewall on
+	// `{}` reported "an EMPTY object `{}` for a payload" instead of naming the
+	// missing `blocked` field, and three verdict tests that assert WHICH field is
+	// absent lost that information.
+	//
+	// This is layering, not an exemption: these types are strictly safer, because
+	// their own guard refuses strictly more bodies than this one does.
+	if _, selfGuarded := target.(interface{ HasVerdict() bool }); selfGuarded {
+		return nil
+	}
+	indeterminate := func(what string) error {
+		return &EvalGuardError{
+			Code:      ErrCodeIndeterminate,
+			RequestID: requestID,
+			Message: fmt.Sprintf("%s %s answered HTTP 2xx %s — this caller asked for a result and the "+
+				"response carries none, so nothing may be derived from it; an empty result here is "+
+				"INDETERMINATE, not \"nothing found\"", method, path, what),
+		}
+	}
+
+	trimmed := bytes.TrimSpace(respBody)
+	if len(trimmed) == 0 {
+		return indeterminate("with an EMPTY body")
+	}
+	if string(trimmed) == "null" {
+		return indeterminate("with a body of the literal JSON `null`")
+	}
+
+	// Resolve the payload EXACTLY the way unmarshalEnvelope does — presence of
+	// `data`, with no `success` key required. A guard that models the wire
+	// differently from the decoder it protects is a new defect, not a fix: the
+	// Java sibling briefly required `success` here and refused
+	// `{"data":{"blocked":false}}`, a real enveloped body both SDKs have always
+	// accepted.
+	payload := trimmed
+	var env map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &env); err == nil {
+		if data, ok := env["data"]; ok {
+			if len(bytes.TrimSpace(data)) == 0 || string(bytes.TrimSpace(data)) == "null" {
+				return indeterminate("with `data: null`")
+			}
+			payload = bytes.TrimSpace(data)
+		}
+	}
+
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &obj); err != nil {
+		return nil // not an object; the decode below reports the real shape error
+	}
+	// An object with NO keys at all is the same "nothing" as a null body wearing
+	// a different hat. Applied to every target kind — including the raw
+	// `map[string]any` security routes — because `{}` cannot be a legitimate
+	// answer from any route: every v1 route replies through apiSuccess(payload).
+	if len(obj) == 0 {
+		return indeterminate("with an EMPTY object `{}` for a payload")
+	}
+
+	fields := jsonFieldNames(reflect.TypeOf(target))
+	if len(fields) == 0 {
+		return nil // not a struct target — see the doc comment
+	}
+	for k := range obj {
+		if fields[strings.ToLower(k)] {
+			return nil
+		}
+	}
+	keys := make([]string, 0, len(obj))
+	for k := range obj {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return indeterminate(fmt.Sprintf("carrying keys %v, none of which belong to the requested %s "+
+		"(expected any of %v)", keys, reflect.Indirect(reflect.ValueOf(target)).Type(), sortedKeys(fields)))
+}
+
+// jsonFieldNames returns the lower-cased JSON names a struct target can absorb,
+// following pointers, slices and embedded structs. An empty result means "not a
+// struct", which requirePayload treats as "no overlap rule applies".
+func jsonFieldNames(t reflect.Type) map[string]bool {
+	out := map[string]bool{}
+	var walk func(reflect.Type, int)
+	walk = func(t reflect.Type, depth int) {
+		if t == nil || depth > 3 {
+			return
+		}
+		for t.Kind() == reflect.Ptr {
+			t = t.Elem()
+		}
+		if t.Kind() != reflect.Struct {
+			return
+		}
+		for i := 0; i < t.NumField(); i++ {
+			f := t.Field(i)
+			tag := strings.Split(f.Tag.Get("json"), ",")[0]
+			if tag == "-" {
+				continue
+			}
+			if f.Anonymous && tag == "" {
+				walk(f.Type, depth+1)
+				continue
+			}
+			name := tag
+			if name == "" {
+				name = f.Name
+			}
+			out[strings.ToLower(name)] = true
+		}
+	}
+	walk(t, 0)
+	return out
+}
+
+func sortedKeys(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // unmarshalEnvelope decodes the standard EvalGuard API response envelope
