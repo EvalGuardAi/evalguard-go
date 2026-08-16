@@ -7,6 +7,198 @@ tag automatically (see `RELEASE.md`). Keep the `clientVersion` constant in
 `evalguard.go` — sent as `x-evalguard-client-version` on every request — in
 lockstep with the release tag.
 
+## v1.6.2 — 2026-08-15
+
+PATCH, and it **corrects `v1.6.1`'s own fix**. Nothing added, no signature
+changed. A Go module version is immutable once `proxy.golang.org` has fetched
+the tag, so if `v1.6.1` is tagged it cannot be corrected in place — this tag is
+the only way the correction reaches a consumer.
+
+### The blanket "refuse every 3xx" broke production traffic
+
+`v1.6.1` refused every `3xx` on the verdict transport. That closes the
+exfiltration hole and **hard-fails a live customer's guardrail**, because
+**production itself redirects on the verdict route**. Measured against live prod
+2026-08-12 with manual redirects:
+
+```
+POST https://evalguard.ai/api/v1/firewall/check/      -> 308  Location: /api/v1/firewall/check
+POST https://evalguard.ai/api/v1/firewall/check       -> 401  (no redirect; the honest path)
+POST http://evalguard.ai/api/v1/firewall/check        -> 301  Location: https://evalguard.ai/api/v1/firewall/check
+POST https://www.evalguard.ai/api/v1/firewall/check   -> 301  Location: https://evalguard.ai/api/v1/firewall/check
+```
+
+A `EVALGUARD_BASE_URL` with a trailing slash therefore produced a hard-failing
+guardrail on `v1.6.1` for a customer who is not under attack at all.
+
+### SAME-HOST-ONLY follow
+
+`sameHostRedirectTarget` replaces the blanket refusal. A `3xx` is followed only
+when **all** of the following hold, and refused otherwise:
+
+| rule | behaviour |
+| --- | --- |
+| `Location` present and parsable | else REFUSE (also refuses two `Location` headers as ambiguous) |
+| target scheme is `http`/`https` | `javascript:` / `file:` / `data:` REFUSE |
+| **scheme + host + PORT identical**, default port normalized away | else REFUSE |
+| no `https` -> `http` downgrade | `http` -> `https` and same-scheme FOLLOW |
+| at most 3 hops | the 4th REFUSE ("too many hops"); a same-host loop terminates |
+| body is replayable | a one-shot `io.Reader` REFUSE |
+
+**The PORT is in the comparison on purpose.** Go's stdlib
+`shouldCopyHeaderOnRedirect` compares HOSTNAME ONLY, and that is exactly the
+comparison that forwarded `Authorization` to a same-hostname/different-port
+target in the 2026-08-10 measurement. `disarmRedirects` therefore STAYS — the
+stdlib must never follow a hop itself. `doRaw` owns the loop.
+
+**METHOD and BODY are preserved on every 3xx code, 301/302/303 included.** This
+is a deliberate deviation from RFC 9110 §15.4. WHATWG `fetch`, Python
+`requests` and Go's own stdlib all rewrite those three into a bodyless GET, and
+that rewrite IS the original defect: it produces a verdict about text that was
+never transmitted. The target is the same host the client already authenticated
+to and already sent the text to, so re-transmitting is not an exfiltration.
+
+`headersForHop` deletes `Authorization`, `Cookie`, `X-Api-Key` and every
+`x-evalguard-*` header on a host change. It is called on the live path. Rule 4
+already refuses a host change, so it normally strips nothing — it exists so the
+control is explicit and tested rather than inherited from `net/http`, and so it
+still holds if the host rule is ever widened. Proved: with the host rule
+deliberately mutated to the stdlib's hostname-only comparison, the redirect was
+followed and the target still received **no** `Authorization` and no
+`x-evalguard-*` header.
+
+Every refusal is the existing `ErrCodeIndeterminate` / `*EvalGuardError`, is
+never retried, and names the status, the from-host, the to-host, the reason and
+the `EVALGUARD_BASE_URL` remediation.
+
+### ⚠️ Intended consequence — `www.` is a HOST CHANGE
+
+`https://www.evalguard.ai/...` -> `https://evalguard.ai/...` **is refused.** A
+customer whose base URL carries the `www.` host gets a hard-failing
+(fail-CLOSED) guardrail. That is correct — a host change is exactly the
+exfiltration vector — and the rule is deliberately NOT widened to "same
+registrable domain" to make it disappear. The fix is a config change:
+
+```
+EVALGUARD_BASE_URL=https://evalguard.ai/api/v1     # canonical host, no `www.`, no trailing slash
+```
+
+Pinned by `same_host_redirect_test.go`, which drives two loopback listeners
+(origin + attacker, same hostname, different ports) and proves four outcomes in
+one run: honest BLOCK, honest ALLOW, same-host `308` carrying a body FOLLOWED
+with the prompt nonce arriving at the final hop, and cross-host `307` REFUSED
+with the attacker receiving zero requests and zero bytes. The cross-host
+assertions in `redirect_verdict_test.go` and the `3xx-redirect` row of
+`failopen_totality_test.go` are unchanged in substance and now stand on a real
+two-listener harness.
+
+## v1.6.1 — never published (its fix ships inside v1.6.2)
+
+PATCH. Two bug fixes, one of them a guardrail bypass; nothing added, no
+signature changed. `v1.6.0` is live on `proxy.golang.org` and a Go module
+version is immutable once the proxy has fetched the tag, so `v1.6.0` cannot be
+corrected in place — this tag is the only way either fix reaches a consumer.
+
+### SECURITY — a redirect defeated the guardrail verdict
+
+**Affects every published version up to and including `v1.6.0`. Upgrade.**
+
+Go's `net/http` follows redirects whenever `CheckRedirect` is `nil`, and this
+SDK never set it. It also carried a source comment *asserting* that it did not
+follow them. The assertion was the bug.
+
+Measured against installed published bytes — **the Go SDK was fully fail-open
+by this route**:
+
+```
+POST /firewall/check   -> 302 Location: http://elsewhere/
+GET  http://elsewhere/    Content-Length: ""  body_bytes=0   <-- text never sent
+                       <- 200 {"success":true,"data":{"blocked":false,"score":0}}
+=> CheckFirewall(...) returned ALLOW
+```
+
+On `301`/`302`/`303` the request becomes a bodyless `GET`, so the responder
+that answered `{"blocked": false}` had never seen the prompt it was answering
+about. On `307`/`308` the body survives, so the screened text is re-POSTed
+verbatim to the redirect target — **and the API key goes with it**: the
+stdlib's `shouldCopyHeaderOnRedirect` compares hostnames only, so a
+same-hostname/different-port hop forwards `Authorization`. That was measured,
+not inferred.
+
+The `v1.6.0` verdict guards did not help. This SDK scored **0/9** on its own
+body-shape checks by this route, and that is not a gap in the checks: a
+redirected reply is perfectly well shaped. It is a well-formed verdict about
+nothing, and shape cannot detect that.
+
+This needs no attacker — an ordinary nginx trailing-slash rule, load balancer or
+proxy on the API path is enough.
+
+**Fixed at the choke point that does the work.** `disarmRedirects` installs
+`http.ErrUseLastResponse` **after** all options are applied, so
+`WithHTTPClient` cannot re-enable following; `doRaw` refuses a `3xx` ahead of
+the retry branches. A caller's `*http.Client` is copied, never mutated. There is
+no legitimate `3xx` on this transport: every URL is built from a validated base
+URL plus a fixed path.
+
+Pinned by `redirect_verdict_test.go`, whose load-bearing assertion is "the
+redirect target received ZERO requests" — not "the SDK returned an error".
+Following the hop and then rejecting the payload would still re-transmit your
+text.
+
+Full advisory: `docs/security/advisory-2026-08-10-verdict-redirect-bypass.md`
+(SEC-051).
+
+### Correctness — twelve Environments/Tools methods called endpoints that do not exist
+
+Every one of them returned 404 for every caller on every published
+version from `v1.3.0` onward, including `v1.6.0` (today's `@latest`).
+
+The Environments/Tools surface landed on 2026-07-08 (`6879c5d64`, PR #1012)
+written to a nested, Humanloop-shaped URL scheme — `/tools/{name}/deployments`,
+`/prompts/{name}/environments`, `/tools/{name}/environment-variables/{var}` —
+while `apps/web` implemented the same feature FLAT:
+`/tools/deployments?name=`, `/prompts/deployments?name=`,
+`/tools/env-vars?name=&varName=`. No rewrite ever bridged the two, so the
+requests fell through to `apps/web/src/app/api/v1/[...catch]/route.ts` and got
+`{"error":"Not found"}`.
+
+PR #1071 (`c7078c49d`, 2026-07-14) repointed the TypeScript and Python SDKs to
+the flat routes. Go and Java were not touched and shipped the nested paths for
+another month. This change applies the same repoint to Go, method for method:
+
+| Method | was (404) | now |
+| --- | --- | --- |
+| `RemoveEnvironment` | `DELETE /environments/{name}` | `DELETE /environments?name=` |
+| `SetPromptDeployment` | `POST /prompts/{name}/deployments` | `POST /prompts/deployments` `{name,version,env}` |
+| `ListPromptEnvironments` | `GET /prompts/{name}/environments` | `GET /prompts/deployments?name=` |
+| `GetTool` | `GET /tools/{name}` | `GET /tools?name=&version=` |
+| `ListToolVersions` | `GET /tools/{name}/versions` | `GET /tools?name=` |
+| `SetToolDeployment` | `POST /tools/{name}/deployments` | `POST /tools/deployments` `{toolName,version,env}` |
+| `RemoveToolDeployment` | `DELETE /tools/{name}/deployments` | `DELETE /tools/deployments?name=&env=` |
+| `ListToolEnvironments` | `GET /tools/{name}/environments` | `GET /tools/deployments?name=` |
+| `GetToolEnvironmentVariables` | `GET /tools/{name}/environment-variables` | `GET /tools/env-vars?name=` |
+| `AddToolEnvironmentVariable` | `POST /tools/{name}/environment-variables` | `POST /tools/env-vars` `{name,variables[]}` |
+| `DeleteToolEnvironmentVariable` | `DELETE /tools/{name}/environment-variables/{var}` | `DELETE /tools/env-vars?name=&varName=` |
+
+Signatures are unchanged. `projectID` is still accepted on each method but is
+no longer sent: the flat routes resolve the org from the API key.
+
+**`RemovePromptDeployment` now fails locally instead of over the wire.** The
+prompt deployments route exports `GET`/`POST`/`PUT` and no `DELETE` — there is
+no un-deploy contract to call. It returns a typed validation error rather than
+spending a round trip to be told 404, matching what the TypeScript and Python
+SDKs already ship. To move a prompt off a version, deploy a different one with
+`SetPromptDeployment`, or roll back via the deployments `PUT` action.
+
+**Why a green suite missed this for a month.** `environments_tools_test.go`
+asserted the *nested* paths against a stub server that answers every route, so
+it only ever confirmed the client sent what the test expected — it could not
+observe that nothing was listening. Those assertions now pin the real flat
+wire shape, and a new gate
+(`packages/sdk/scripts/route-parity.cjs`, enforced by
+`packages/sdk/src/__tests__/route-parity.test.ts`) fails the build when any SDK
+call site in any of the four SDKs targets a path with no route handler.
+
 ## 1.6.0 — 2026-08-07
 
 **Security — `1.5.0` closed seven of the fail-open methods. This closes the
